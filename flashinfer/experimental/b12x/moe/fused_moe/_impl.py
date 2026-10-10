@@ -12604,6 +12604,19 @@ def _launch_dynamic_topk_sum(
     route_expert_ids: torch.Tensor,
     stream,
 ) -> None:
+    del stream
+    _dynamic_topk_sum_op(route_output, output, m, num_topk, k, route_expert_ids)
+
+
+@torch.library.custom_op("b12x::moe_route_sum", mutates_args=("output",))
+def _dynamic_topk_sum_op(
+    route_output: torch.Tensor,
+    output: torch.Tensor,
+    m: int,
+    num_topk: int,
+    k: int,
+    route_expert_ids: torch.Tensor,
+) -> None:
     if route_output.numel() < m * num_topk * k:
         raise RuntimeError(
             "top-k reduction exceeds the planned route-output capacity: "
@@ -12632,7 +12645,7 @@ def _launch_dynamic_topk_sum(
         num_topk,
         k,
         element_dtype,
-        int(stream),
+        int(current_cuda_stream()),
         _int32_route_ids(route_expert_ids),
         launcher=launcher,
     )
@@ -12642,6 +12655,11 @@ def _int32_route_ids(route_expert_ids: torch.Tensor) -> torch.Tensor:
     if route_expert_ids.dtype == torch.int32:
         return route_expert_ids
     return route_expert_ids.to(torch.int32)
+
+
+@_dynamic_topk_sum_op.register_fake
+def _dynamic_topk_sum_fake(route_output, output, m, num_topk, k, route_expert_ids) -> None:
+    pass
 
 
 def _launch_compact_micro_flat(
