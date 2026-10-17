@@ -90,11 +90,40 @@ def test_trellis_direct_table_preserves_cooperative_residency(
         trellis_decode_table=mode,
     )
     assert kernel.trellis_direct_lut == expected
+    assert kernel.lut_e4m3_smem
     assert kernel.shared_words * 4 <= kernel.fc1.max_shared_mem
     if expected:
         assert kernel.blocks_per_sm == 1
-        assert kernel.lut_e4m3_smem
         assert kernel.fc1.trellis_direct_lut and kernel.fc2.trellis_direct_lut
+
+
+@pytest.mark.parametrize("layout", ("packed", "modelopt", "iq2_xs", "iq2_xxs", "q8_0"))
+def test_non_trellis_layout_does_not_stage_trellis_table(monkeypatch, layout):
+    from b12x.moe._shared.kernels.w4a16.kernel.fused import W4A16FusedMoeKernel
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv("B12X_LUT_E4M3_SMEM", "1")
+    kernel = W4A16FusedMoeKernel(
+        size_m=128,
+        hidden_size=1024,
+        intermediate_size=2048,
+        num_experts=256,
+        top_k=9,
+        activation="relu2",
+        apply_router_weight_on_input=False,
+        zero_fc2_output=False,
+        fc1_tile_n=128,
+        fc1_tile_k=128,
+        fc2_tile_n=128,
+        fc2_tile_k=128,
+        moe_block_size=16,
+        max_m_blocks=1024,
+        weight_layout=layout,
+        scale_format=layout if layout in {"iq2_xs", "iq2_xxs", "q8_0"} else "e4m3_k16",
+    )
+    assert not kernel.lut_e4m3_smem
+    assert not kernel.fc1.lut_e4m3_smem
+    assert not kernel.fc2.lut_e4m3_smem
 
 
 class _Variant:
