@@ -6735,6 +6735,7 @@ def plan_b12x_fp4_moe_weights(
     num_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    csf_inline_scales: bool = False,
     w13_layout: str = "w13",
     w4a16_layout: PreparedWeightLayout | str | None = None,
     trellis_bits: int | None = None,
@@ -6780,6 +6781,7 @@ def plan_b12x_fp4_moe_weights(
 
     return replace(
         result,
+        csf_inline_scales=bool(csf_inline_scales),
     )
 
 
@@ -11238,6 +11240,7 @@ def _get_dynamic_kernel(
     w4a8_repacked: bool = False,
     w4a8_n64_repacked: bool = False,
     nvfp4_materialize_intermediate: bool = False,
+    csf_inline_scales: bool = False,
     mma_warps: int | None = None,
     direct_routing: bool = False,
     external_route_plan: bool = False,
@@ -11378,6 +11381,7 @@ def _get_dynamic_kernel(
         mma_warps,
         int(trellis_bits),
         bool(trellis_intermediate_hadamard),
+        *(("csf_inline_scales",) if csf_inline_scales else ()),
     )
     reuse_compiled = _first_env(
         "B12X_DYNAMIC_REUSE_COMPILED",
@@ -11446,6 +11450,8 @@ def _get_dynamic_kernel(
         # "e2m3" FP6 weights); w8a8_mx keeps mxfp6_fmt_a/b unset so the kernel
         # emits the native MmaMXF8Op instead of the inline FP6 MMA.
         kernel_kwargs["quant_recipe"] = quant_mode
+    if csf_inline_scales:
+        kernel_kwargs["csf_inline_scales"] = True
     kernel = activation_spec.make_dynamic_kernel(**kernel_kwargs)
     if is_w4a8:
         launch = _DynamicMoEW4A8Launch(
@@ -11780,6 +11786,7 @@ def _launch_dynamic_flat(
     w4a8_repacked: bool,
     w4a8_n64_repacked: bool,
     nvfp4_materialize_intermediate: bool,
+    csf_inline_scales: bool,
     mma_warps: int | None = None,
     share_input_across_experts: bool,
     deterministic_output: bool,
@@ -11991,6 +11998,7 @@ def _launch_dynamic_flat(
         w4a8_repacked=w4a8_repacked,
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
+        csf_inline_scales=csf_inline_scales,
         mma_warps=mma_warps,
         direct_routing=direct_routing,
         external_route_plan=external_route_plan,
@@ -12143,6 +12151,7 @@ def _encode_dynamic_launch_policy(
     planned_direct_routing: bool,
     w4a8_n64_repacked: bool,
     nvfp4_materialize_intermediate: bool = False,
+    csf_inline_scales: bool = False,
     mma_warps: int | None = None,
     swiglu_clamp_after_silu: bool = False,
 ) -> int:
@@ -12165,7 +12174,8 @@ def _encode_dynamic_launch_policy(
         | (int(bool(nvfp4_materialize_intermediate)) << 6)
         | (int(mma_warps == 4) << 7)
         | (int(bool(swiglu_clamp_after_silu)) << 8)
-        | ((int(policy_max_active_clusters) + 1) << 9)
+        | (int(bool(csf_inline_scales)) << 9)
+        | ((int(policy_max_active_clusters) + 1) << 10)
     )
 
 
@@ -12181,7 +12191,7 @@ def _decode_dynamic_launch_policy(
         bool(value & 32),
         bool(value & 64),
         4 if value & 128 else None,
-        (value >> 9) - 1,
+        (value >> 10) - 1,
     )
 
 
@@ -12354,6 +12364,7 @@ def _tp_moe_dynamic_launch_op(
         w4a8_repacked=w4a8_repacked,
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
+        csf_inline_scales=bool(launch_policy & 512),
         mma_warps=mma_warps,
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
@@ -12464,6 +12475,7 @@ def _launch_dynamic(
     w4a8_prepared: dict | None = None,
     w4a8_n64_repacked: bool = False,
     nvfp4_materialize_intermediate: bool = False,
+    csf_inline_scales: tuple | None = None,
     mma_warps: int | None = None,
     share_input_across_experts: bool = False,
     deterministic_output: bool = False,
@@ -12488,6 +12500,7 @@ def _launch_dynamic(
         planned_direct_routing=dynamic_route_mode == "direct",
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
+        csf_inline_scales=csf_inline_scales is not None,
         mma_warps=mma_warps,
         swiglu_clamp_after_silu=swiglu_clamp_after_silu,
     )
@@ -12519,6 +12532,10 @@ def _launch_dynamic(
         if weights.dynamic_down_sf is not None
         else weights.down_sf
     )
+    if csf_inline_scales is not None:
+        dynamic_w13_sf, dynamic_down_sf = (p.storage for p in csf_inline_scales)
+        if w4a8_repacked:
+            w13_sfb_rp, down_sfb_rp = dynamic_w13_sf, dynamic_down_sf
     sfb_down_mx = weights.sfb_down_mx
     torch.ops.b12x.tp_moe_dynamic_launch(
         workspace.packed_a_view,
@@ -13351,8 +13368,16 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         and binding.implementation == "micro"
         and topk_ids.numel() > 0
     )
-    if experts.nvfp4_csf is not None and not (
-        binding.scales_expanded and not csf_reset_barriers
+    inline_scales = None
+    if experts.nvfp4_csf is not None and plan.decode_config.csf_inline_scales:
+        inline_scales = (
+            experts.nvfp4_csf.first.scales,
+            experts.nvfp4_csf.second.scales,
+        )
+    if (
+        experts.nvfp4_csf is not None
+        and inline_scales is None
+        and not (binding.scales_expanded and not csf_reset_barriers)
     ):
         barriers = (
             (
@@ -13551,6 +13576,11 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         )
 
         prepared = prepared_payload
+        if inline_scales is not None:
+            scale_fields = dict(
+                w13_scale=inline_scales[0].storage, w2_scale=inline_scales[1].storage
+            )
+            prepared = replace(prepared, **scale_fields)
         if prepared is None:
             raise RuntimeError(
                 "the W4A16 weight plan did not materialize its required representation"
@@ -13855,9 +13885,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             w13=wv.w1_storage,
-            w13_scales=(wv.w1_scale_storage),
+            w13_scales=wv.w1_scale_storage,
             w2=wv.w2_storage,
-            w2_scales=(wv.w2_scale_storage),
+            w2_scales=wv.w2_scale_storage,
             alpha1=wv.w1_alpha,
             alpha2=wv.w2_alpha,
             input_scale=input_gs,
@@ -13945,6 +13975,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             activation=activation,
             quant_mode=quant_mode,
             w4a8_prepared=dynamic_w4a8_prepared,
+            csf_inline_scales=inline_scales,
             w4a8_n64_repacked=bool(getattr(prepared_payload, "n64_repack", False)),
             nvfp4_materialize_intermediate=decode_config.nvfp4_materialize_intermediate,
             mma_warps=decode_config.dynamic_mma_warps,
