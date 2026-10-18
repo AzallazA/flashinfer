@@ -111,6 +111,45 @@
       "backend": "tlc",
       "invariant": "sourceSafe,counterBound",
       "expected": "pass"
+    },
+    "ring-tlc-window2-one-origin": {
+      "file": "ring_window2_one_origin.qnt",
+      "module": "ring_window2_one_origin",
+      "backend": "tlc",
+      "invariant": "healthySafety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "ring-tlc-window2-two-origins": {
+      "file": "ring_window2_two_origins.qnt",
+      "module": "ring_window2_two_origins",
+      "backend": "tlc",
+      "invariant": "healthySafety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "ring-tlc-window2-ack-chain": {
+      "file": "ring_window2_ack_chain.qnt",
+      "module": "ring_window2_ack_chain",
+      "backend": "tlc",
+      "invariant": "healthySafety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "ring-tlc-window2-two-rails": {
+      "file": "ring_window2_two_rails.qnt",
+      "module": "ring_window2_two_rails",
+      "backend": "tlc",
+      "invariant": "healthySafety",
+      "temporal": "healthyProgress",
+      "expected": "pass"
+    },
+    "ring-tlc-window2-no-reuse-wait": {
+      "file": "ring_window2_no_reuse_wait.qnt",
+      "module": "ring_window2_no_reuse_wait",
+      "backend": "tlc",
+      "invariant": "sourceSafe",
+      "expected": "counterexample"
     }
   },
   "optional_cases": {

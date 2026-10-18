@@ -9,6 +9,12 @@ module ring {
   const ADMISSION_LIMIT: int
   const FAILED_RANK: int
   const SERVICE_WHILE_WAITING: bool
+  // Mailbox slots per origin and rail at every relay; packet n uses slot (n - 1) mod WINDOW. A relay
+  // tracks the last serial it completed per slot, so slots of one origin and rail progress independently.
+  const WINDOW: int
+  // An origin admits serial n only after serial n - WINDOW is acknowledged, so the slot it
+  // reuses is free; false is the protocol mutation that reuses a slot while it is still live.
+  const SLOT_REUSE_WAIT: bool
 
   pure val Ranks = 0.to(WORLD - 1)
   pure val Rails = 0.to(RAILS - 1)
@@ -19,16 +25,18 @@ module ring {
   pure val Data = tuples(ORIGINS, Rails, 1.to(SERIALS), Set(0), 1.to(Distance))
   pure val Acks = tuples(ORIGINS, Rails, 1.to(SERIALS), Set(1), 1.to(Distance - 1))
   pure val Works = Data.union(Acks)
-  pure val Boxes = tuples(ORIGINS, Rails, 1.to(Distance - 1))
+  pure val Slots = 0.to(WINDOW - 1)
+  pure val Boxes = tuples(ORIGINS, Rails, 1.to(Distance - 1), Slots)
+  pure def slot(serial: int): int = (serial - 1) % WINDOW
   type State = {
     admitted: Set[Packet],
     acknowledged: Set[Packet],
     delivered: Set[Packet],
     wire: Work -> int,
     ticket: Work -> int,
-    mailbox: (int, int, int) -> int,
+    mailbox: (int, int, int, int) -> int,
     pending: Set[Work],
-    seen: (int, int, int) -> int,
+    seen: (int, int, int, int) -> int,
     corrupt: bool,
     timedOut: bool
   }
@@ -63,7 +71,8 @@ module ring {
   }
   def canAdmit(p: Packet): bool = all {
     not(s.admitted.contains(p)),
-    p._3 == 1 or s.acknowledged.contains((p._1, p._2, p._3 - 1)),
+    p._3 == 1 or s.admitted.contains((p._1, p._2, p._3 - 1)),
+    not(SLOT_REUSE_WAIT) or p._3 <= WINDOW or s.acknowledged.contains((p._1, p._2, p._3 - WINDOW)),
     outstanding(data(p, 1)) < ADMISSION_LIMIT
   }
   action admit(p: Packet): bool = all {
@@ -75,7 +84,7 @@ module ring {
   def canForward(w: Work): bool = all {
     w._4 == 0, w._5 > 1, s.wire.get(w) == 0,
     s.wire.get(data(packet(w), w._5 - 1)) >= 4,
-    s.seen.get((w._1, w._2, w._5 - 1)) < w._3,
+    s.seen.get((w._1, w._2, w._5 - 1, slot(w._3))) < w._3,
     not(s.pending.contains(w)),
     servicing(sender(w)), outstanding(w) < ADMISSION_LIMIT
   }
@@ -89,14 +98,14 @@ module ring {
     w._4 == 0, s.wire.get(w) == 1, healthy(w), orderReady(w, 2),
     s' = { wire: s.wire.set(w, 2),
       corrupt: s.corrupt or (if (w._5 == 1)
-        s.admitted.exists(p => p._1 == w._1 and p._2 == w._2 and p._3 > w._3)
-        else s.mailbox.get((w._1, w._2, w._5 - 1)) != w._3), ...s }
+        s.admitted.exists(p => p._1 == w._1 and p._2 == w._2 and p._3 >= w._3 + WINDOW)
+        else s.mailbox.get((w._1, w._2, w._5 - 1, slot(w._3))) != w._3), ...s }
   }
   action deliverPayload(w: Work): bool = all {
     w._4 == 0, s.wire.get(w) == 2, healthy(w), orderReady(w, 3),
     s' = { wire: s.wire.set(w, 3),
       mailbox: (if (w._5 < Distance)
-        s.mailbox.set((w._1, w._2, w._5), w._3) else s.mailbox), ...s }
+        s.mailbox.set((w._1, w._2, w._5, slot(w._3)), w._3) else s.mailbox), ...s }
   }
   action publishFlag(w: Work): bool = all {
     w._4 == 0, s.wire.get(w) == 3, healthy(w), orderReady(w, 4),
@@ -125,7 +134,7 @@ module ring {
     canAck(w),
     s' = { wire: s.wire.set(w, 1), ticket: s.ticket.set(w, nextTicket(w)),
       pending: s.pending.exclude(Set(data(packet(w), w._5 + 1))),
-      seen: s.seen.set((w._1, w._2, w._5), w._3), ...s }
+      seen: s.seen.set((w._1, w._2, w._5, slot(w._3)), w._3), ...s }
   }
   action usefulStep = any {
     { nondet p = Packets.oneOf(); admit(p) },
@@ -153,8 +162,8 @@ module ring {
   val sourceSafe = not(s.corrupt)
   val ackAfterPayload = s.acknowledged.subseteq(s.delivered)
   val creditsSafe = Packets.forall(p =>
-    not(s.admitted.contains(p)) or p._3 == 1 or
-      s.acknowledged.contains((p._1, p._2, p._3 - 1)))
+    not(s.admitted.contains(p)) or p._3 <= WINDOW or
+      s.acknowledged.contains((p._1, p._2, p._3 - WINDOW)))
   // Each admitted data WR can use three WQEs. Unpolled ACK completions may
   // survive serial reuse, so the finite bound includes every modeled serial.
   val queueBound = Works.forall(w =>
@@ -169,51 +178,51 @@ module ring {
 module ring_4r1h {
   import ring(WORLD = 4, RAILS = 1, PATH_LENGTH = 2,
     DIRECTIONS = Map(0 -> 1, 1 -> 1, 2 -> 1, 3 -> 1), ORIGINS = Set(0, 1, 2, 3), SERIALS = 1,
-    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true).*
+    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true, WINDOW = 1, SLOT_REUSE_WAIT = true).*
 }
 module ring_4r2h {
   import ring(WORLD = 4, RAILS = 2, PATH_LENGTH = 2,
     DIRECTIONS = Map(0 -> 1, 1 -> 1, 2 -> 1, 3 -> 1), ORIGINS = Set(0, 1, 2, 3), SERIALS = 1,
-    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true).*
+    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true, WINDOW = 1, SLOT_REUSE_WAIT = true).*
 }
 module ring_reuse {
   import ring(WORLD = 4, RAILS = 1, PATH_LENGTH = 2,
     DIRECTIONS = Map(0 -> 1, 1 -> 1), ORIGINS = Set(0, 1), SERIALS = 2,
-    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true).*
+    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true, WINDOW = 1, SLOT_REUSE_WAIT = true).*
 }
 module ring_ack_chain {
   import ring(WORLD = 6, RAILS = 1, PATH_LENGTH = 3,
     DIRECTIONS = Map(0 -> 1, 3 -> 1), ORIGINS = Set(0, 3), SERIALS = 1,
-    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true).*
+    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true, WINDOW = 1, SLOT_REUSE_WAIT = true).*
 }
 module ring_without_service {
   import ring(WORLD = 4, RAILS = 1, PATH_LENGTH = 2,
     DIRECTIONS = Map(0 -> 1, 1 -> 1, 2 -> 1, 3 -> 1), ORIGINS = Set(0, 1, 2, 3), SERIALS = 1,
-    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = false).*
+    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = false, WINDOW = 1, SLOT_REUSE_WAIT = true).*
 }
 module ring_failed_rank {
   import ring(WORLD = 4, RAILS = 1, PATH_LENGTH = 2,
     DIRECTIONS = Map(0 -> 1), ORIGINS = Set(0), SERIALS = 1,
-    ADMISSION_LIMIT = 1, FAILED_RANK = 1, SERVICE_WHILE_WAITING = true).*
+    ADMISSION_LIMIT = 1, FAILED_RANK = 1, SERVICE_WHILE_WAITING = true, WINDOW = 1, SLOT_REUSE_WAIT = true).*
 }
 
 module ring_mixed_directions {
   import ring(WORLD = 5, RAILS = 1, PATH_LENGTH = 2,
     DIRECTIONS = Map(0 -> 1, 2 -> -1), ORIGINS = Set(0, 2), SERIALS = 1,
-    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true).*
+    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true, WINDOW = 1, SLOT_REUSE_WAIT = true).*
 }
 module ring_4r_two_origins {
   import ring(WORLD = 4, RAILS = 1, PATH_LENGTH = 2,
     DIRECTIONS = Map(0 -> 1, 1 -> 1), ORIGINS = Set(0, 1), SERIALS = 1,
-    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true).*
+    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true, WINDOW = 1, SLOT_REUSE_WAIT = true).*
 }
 module ring_reuse_one_origin {
   import ring(WORLD = 4, RAILS = 1, PATH_LENGTH = 2,
     DIRECTIONS = Map(0 -> 1), ORIGINS = Set(0), SERIALS = 2,
-    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true).*
+    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true, WINDOW = 1, SLOT_REUSE_WAIT = true).*
 }
 module ring_two_rails_one_origin {
   import ring(WORLD = 4, RAILS = 2, PATH_LENGTH = 2,
     DIRECTIONS = Map(0 -> 1), ORIGINS = Set(0), SERIALS = 1,
-    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true).*
+    ADMISSION_LIMIT = 1, FAILED_RANK = -1, SERVICE_WHILE_WAITING = true, WINDOW = 1, SLOT_REUSE_WAIT = true).*
 }

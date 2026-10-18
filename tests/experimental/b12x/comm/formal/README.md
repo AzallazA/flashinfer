@@ -31,6 +31,8 @@ Paths in this table are relative to the repository root.
 | Publish payload before mailbox serial or destination flag | `ring.readSource`, `deliverPayload`, `publishFlag` | `_roce_proxy.c`, ordered work requests in `ring_submit` and final-hop forwarding |
 | Return acknowledgments after final-hop completion or downstream acknowledgment | `ring.sendAck`, `deliverAck` | `_roce_proxy.c`, `ring_complete`, `ring_service`, `drain_cq` |
 | Continue servicing relay traffic while an origin waits | `SERVICE_WHILE_WAITING` | `_roce_proxy.c`, `ring_post` calls `drain_all`, which polls CQs and calls `ring_service` |
+| Admit serial n into slot (n - 1) mod WINDOW once serial n - WINDOW is acknowledged | `WINDOW`, `SLOT_REUSE_WAIT`, `ring.canAdmit` | `_roce_proxy.c`, `RING_WINDOW`, `ring_post` waits for the prior serial's acknowledgment before reusing its slot |
+| Forward a slot whose serial differs from the one last completed in that slot | `ring.canForward`, `seen` | `_roce_proxy.c`, `ring_service_slot` against `ring_seen[origin][rail][slot]`; `ring_complete` records the serial |
 
 `_routes.py:plan_routes` plans routes only for rank-order neighbors when
 `ring=True`; the proxy's `roce_connect` connects those QPs and leaves
@@ -88,11 +90,16 @@ state predicate; universal quantification has the corresponding equivalence.
 Every lookup uses a member of `Works`, including the first-hop data work created
 from a packet. These helpers preserve the protocol transition relation.
 
-Every relay has a private mailbox for each origin and rail. A packet occupies
-that mailbox while forwarding or waiting for its downstream acknowledgment. The
-origin admits the following serial only after the acknowledgment returns along
-the full reverse path. Payload source reads, remote payload delivery, serial or
-flag visibility, and CQ polling are separate transitions.
+Every relay has `WINDOW` private mailbox slots for each origin and rail; packet
+serial n occupies slot (n - 1) mod `WINDOW` while forwarding or waiting for its
+downstream acknowledgment. The origin admits serials in order and admits serial n
+only after the acknowledgment of serial n - `WINDOW` returns along the full
+reverse path, so the slot it reuses is free (`SLOT_REUSE_WAIT`). A relay keeps
+the last serial it completed per slot, so the slots of one origin and rail
+progress independently and a later serial may complete before an earlier one.
+Payload source reads, remote payload delivery, serial or flag visibility, and CQ
+polling are separate transitions. `WINDOW = 1` is the one-slot protocol; the
+instances in `ring.qnt` use it.
 
 The model orders visibility within each peer/rail QP and shares each QP's
 admission counter across origins. Data admission stops at `ADMISSION_LIMIT`;
@@ -110,8 +117,8 @@ five- and six-rank configurations execute on a single model-checker process;
 they do not require that many physical hosts. Direct neighbor traffic and the
 two-rank ring fast path are outside the relay model.
 
-Each origin may have one packet per rail in flight in the model. The native
-`ring_post` loop serializes rails and target packets more tightly. Relay service
+Each origin may have up to `WINDOW` packets per rail in flight in the model. The
+native `ring_post` loop serializes rails and target packets more tightly. Relay service
 and CQ polling can run between native waiting-loop iterations. The model permits
 additional origin concurrency and abstracts an RDMA payload/header chain as one
 source-lifetime unit; it does not model individual header cache lines, provider
@@ -197,3 +204,14 @@ inconclusive even when shorter or more restricted checks pass.
 Separate exhaustive single-origin cases cover two consecutive serials through
 the same mailbox and independent progress of two rails. Their smaller state
 graphs complement the adjacent-origin QP contention and mixed-direction cases.
+
+The `ring_window2_*` files each hold one instance with two slots per origin and
+rail (`WINDOW = 2`, `ADMISSION_LIMIT = 2`): one origin with four serials, so the
+third and fourth serials reuse both slots; two adjacent origins with two
+serials each, both slots in flight on the QP they share; the six-rank
+acknowledgment chain with three serials; and two rails with three serials. TLC checks `healthySafety` and `healthyProgress` on
+each. `ring_window2_no_reuse_wait` removes the wait for the acknowledgment of
+the serial that last used a slot and is expected to violate `sourceSafe`: the
+reused slot is overwritten while its earlier payload is still being read. One
+instance per file keeps each check's translation request within Apalache's
+20 MB limit.
