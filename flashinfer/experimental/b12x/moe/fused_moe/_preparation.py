@@ -29,7 +29,7 @@ from ._impl import (
     tp_moe_required_nbytes,
 )
 from ._tuning import FC2_TUNING, ROUTE_TUNING, MoeDecodeConfig, MoeDecodeQuery, TUNING
-from .planning import ActivationMode, _packed_recipe
+from .planning import _packed_recipe
 from .weights import PreparedExperts
 from .execution import ExecutionCapacity, RoutingSpec
 
@@ -112,8 +112,6 @@ def _decode_scalar(value):
 
 def _quant_mode(experts: PreparedExperts, config: MoeDecodeConfig) -> str:
     modes = experts.plan._impl.quant_modes
-    if experts.plan.activation.mode is ActivationMode.AUTO:
-        return "w4a16" if config.backend == "w4a16" else "nvfp4"
     # A canonical weight plan may intentionally retain more than one recipe.
     # The selected backend determines the A16 route; all other retained recipes
     # use their declared concrete mode rather than assuming an arbitrary set order.
@@ -198,16 +196,12 @@ def _query(
 ) -> MoeDecodeQuery:
     plan = experts.plan._impl
     quant_modes = tuple(sorted(plan.quant_modes))
-    quant_mode = (
-        "nvfp4_auto"
-        if experts.plan.activation.mode is ActivationMode.AUTO
-        else (quant_modes[0] if len(quant_modes) == 1 else "multi")
-    )
+    quant_mode = quant_modes[0] if len(quant_modes) == 1 else "multi"
     cutoff = experts.plan.activation.a16_max_tokens
     if cutoff:
         if tokens <= cutoff:
             quant_mode, quant_modes = "w4a16", ("w4a16",)
-        elif experts.plan.activation.mode is not ActivationMode.AUTO:
+        else:
             quant_mode = _packed_recipe(
                 experts.plan.source, experts.plan.activation.mode
             )
@@ -324,9 +318,7 @@ def _lower_caps(
 ) -> TPMoEScratchCaps:
     """One config-to-Caps lowering shared by compilation, sizing and serving."""
     mode = query.quant_mode
-    if mode == "nvfp4_auto":
-        mode = "w4a16" if config.backend == "w4a16" else "nvfp4"
-    elif mode == "multi":
+    if mode == "multi":
         if config.backend == "w4a16":
             mode = "w4a16"
         else:

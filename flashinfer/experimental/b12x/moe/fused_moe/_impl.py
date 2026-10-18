@@ -2724,14 +2724,9 @@ def _heuristic_dynamic_route_mode(
 
 
 def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
-    weight_layout = (
-        "modelopt"
-        if query.quant_mode == "nvfp4_auto"
-        else query.w4a16_weight_layout
-        or _w4a16_weight_layout_for_source(
-            query.source_format,
-            intermediate_size=query.intermediate_size,
-        )
+    weight_layout = query.w4a16_weight_layout or _w4a16_weight_layout_for_source(
+        query.source_format,
+        intermediate_size=query.intermediate_size,
     )
     if weight_layout in BLOCK_CODECS:
         from b12x.moe._shared.kernels.w4a16.kernel.config import _TC_DECODE_MAX_M
@@ -2831,20 +2826,6 @@ def _heuristic_moe_decode_config(
     """Choose the backend, tile, and route mode for a decode query without tuning
     data.
     """
-    if query.quant_mode == "nvfp4_auto":
-        if (
-            device is not None
-            and device.compute_capability in ((12, 0), (12, 1))
-            and 1 <= query.num_tokens <= 8
-            and _w4a16_direct_routing_supported(query)
-        ):
-            return MoeDecodeConfig(
-                backend="w4a16",
-                route_planner="internal",
-                max_active_clusters=None,
-                w4a16_route_mode="direct",
-            )
-        return _heuristic_moe_decode_config(replace(query, quant_mode="nvfp4"), device)
     if query.quant_mode == "w4a16":
         return MoeDecodeConfig(
             backend="w4a16",

@@ -298,7 +298,7 @@ def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> No
 
 
 def _nvfp4_query(query):
-    return query.quant_mode in {"nvfp4", "nvfp4_auto"} or (
+    return query.quant_mode == "nvfp4" or (
         query.quant_mode == "multi" and "nvfp4" in query.quant_modes
     )
 
@@ -423,22 +423,6 @@ def validate_moe_decode_config(
                     "non-W4A16 multi-recipe MoE requires an explicit recipe route"
                 )
             query = replace(query, quant_mode=non_a16[0])
-    if query.quant_mode == "nvfp4_auto":
-        if query.source_format != "modelopt_nvfp4" or query.activation != "silu":
-            raise ValueError(
-                "automatic MoE precision requires ModelOpt NVFP4 weights and SiLU"
-            )
-        if (
-            config.backend == "w4a16"
-            and config.w4a16_route_mode == "direct"
-            and query.num_tokens > 8
-        ):
-            raise ValueError(
-                "source-native A16 direct decode requires capacity at most 8"
-            )
-        query = replace(
-            query, quant_mode="w4a16" if config.backend == "w4a16" else "nvfp4"
-        )
     if config.dynamic_mma_warps is not None and not (
         type(config.dynamic_mma_warps) is int
         and config.dynamic_mma_warps == 4
@@ -735,8 +719,6 @@ def _materialize_tuning(query, device, choice):
                     "non-W4A16 multi-recipe MoE requires an explicit recipe route"
                 )
             effective_query = replace(query, quant_mode=non_a16[0])
-    elif query.quant_mode == "nvfp4_auto" and config.backend != "w4a16":
-        effective_query = replace(query, quant_mode="nvfp4")
     if (
         config.backend == "micro"
         and effective_query.quant_mode == "w4a8_mx"
@@ -959,7 +941,6 @@ TUNING = TuningContract(
     default_config=_default_config,
     candidate_contract_version=34,
     knobs=(
-        # Enumeration order prefers A16 at equal measured latency on every rank.
         Knob(
             name="backend",
             values=("w4a16", "micro", "dynamic"),

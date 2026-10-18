@@ -41,7 +41,6 @@ class ActivationMode(str, Enum):
     A16 = "a16"
     A8 = "a8"
     A4 = "a4"
-    AUTO = "auto"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -281,7 +280,6 @@ def plan_weights(
         )
 
     if isinstance(source, PackedSource):
-        automatic = activation.mode is ActivationMode.AUTO
         if activation.a16_max_tokens and (
             source.format.value != "modelopt_nvfp4"
             or activation.io_dtype is not torch.bfloat16
@@ -289,30 +287,9 @@ def plan_weights(
             raise ValueError(
                 "A16 token cutoff requires BF16 inputs and ModelOpt NVFP4 weights"
             )
-        if automatic and (
-            source.format.value != "modelopt_nvfp4"
-            or activation.io_dtype is not torch.bfloat16
-            or activation.nonlinearity != "silu"
-        ):
-            raise ValueError(
-                "automatic MoE precision requires BF16 inputs, SiLU, and ModelOpt NVFP4 weights"
-            )
-        if automatic and constraints.required_packing not in {
-            None,
-            WeightPacking.SOURCE_NATIVE,
-        }:
-            raise ValueError(
-                "automatic MoE precision requires source-native weight storage"
-            )
-        if automatic and source.w13_layout.value != "w13":
-            raise ValueError("automatic MoE precision requires up/gate W13 row order")
-        recipe = _packed_recipe(
-            source, ActivationMode.A4 if automatic else activation.mode
-        )
+        recipe = _packed_recipe(source, activation.mode)
         shared_a16 = activation.a16_max_tokens > 0 and recipe != "w4a16"
         requested_layout = None
-        if automatic:
-            requested_layout = WeightPacking.SOURCE_NATIVE.value
         if recipe == "w4a16" and constraints.required_packing is not None:
             if constraints.required_packing not in {
                 WeightPacking.SOURCE_NATIVE,
@@ -326,13 +303,7 @@ def plan_weights(
                 )
             requested_layout = constraints.required_packing.value
         raw_plan = plan_b12x_fp4_moe_weights(
-            quant_modes=(
-                ("nvfp4", "w4a16")
-                if automatic
-                else (recipe, "w4a16")
-                if shared_a16
-                else recipe
-            ),
+            quant_modes=(recipe, "w4a16") if shared_a16 else recipe,
             source_format=source.format.value,
             activation=activation.nonlinearity,
             params_dtype=activation.io_dtype,

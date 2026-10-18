@@ -31,7 +31,7 @@ def weight_plan(**kwargs):
         activation=kwargs.pop(
             "activation",
             fused_moe.ActivationSpec(
-                mode=fused_moe.ActivationMode.AUTO,
+                mode=fused_moe.ActivationMode.A4,
                 nonlinearity="silu",
                 io_dtype=torch.bfloat16,
             ),
@@ -40,37 +40,15 @@ def weight_plan(**kwargs):
     )
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("io_dtype", torch.float16),
-        ("nonlinearity", "relu2"),
-    ],
-)
-def test_auto_rejects_unsupported_activation(field, value):
-    activation = replace(weight_plan().activation, **{field: value})
-    with pytest.raises(ValueError, match="automatic MoE precision"):
-        weight_plan(activation=activation)
+def test_activation_precision_must_be_explicit():
+    with pytest.raises(ValueError, match="ActivationMode"):
+        replace(weight_plan().activation, mode="auto")
 
 
-def test_auto_requires_nvfp4_native_storage():
+def test_a4_requires_only_nvfp4_weights():
     plan = weight_plan()
-    assert plan._impl.quant_modes == {"nvfp4", "w4a16"}
-    assert plan.prepared_format.packing is fused_moe.WeightPacking.SOURCE_NATIVE
-    with pytest.raises(ValueError, match="up/gate"):
-        weight_plan(source=replace(plan.source, w13_layout=fused_moe.W13Layout.W31))
-    with pytest.raises(ValueError, match="source-native"):
-        weight_plan(
-            constraints=fused_moe.WeightPlanConstraints(
-                required_packing=fused_moe.WeightPacking.MMA_PACKED,
-            )
-        )
-    with pytest.raises(ValueError, match="ModelOpt NVFP4"):
-        weight_plan(
-            source=fused_moe.PackedSource(
-                format=fused_moe.PackedSourceFormat.MXFP4_E8M0_K32,
-            )
-        )
+    assert plan._impl.quant_modes == {"nvfp4"}
+    assert plan._impl.w4a16_weight_layout is None
 
 
 def test_uniform_nvfp4_a16_requires_only_mma_packing():
@@ -90,7 +68,7 @@ def test_uniform_nvfp4_a16_requires_only_mma_packing():
 
 @pytest.mark.parametrize(
     "mode,larger_recipe",
-    (("a4", "nvfp4"), ("a8", "w4a8_nvfp4"), ("auto", "nvfp4_auto")),
+    (("a4", "nvfp4"), ("a8", "w4a8_nvfp4")),
 )
 def test_a16_cutoff_uses_existing_precision_candidates(mode, larger_recipe):
     from types import SimpleNamespace
@@ -103,13 +81,10 @@ def test_a16_cutoff_uses_existing_precision_candidates(mode, larger_recipe):
     base = weight_plan()
     plan = weight_plan(
         activation=replace(base.activation, mode=mode, a16_max_tokens=32),
-        source=replace(base.source, w13_layout="w13" if mode == "auto" else "w31"),
+        source=replace(base.source, w13_layout="w31"),
     )
     assert plan._impl.w13_layout == "w13"
-    assert plan._impl.quant_modes == {
-        "w4a16",
-        "nvfp4" if mode == "auto" else larger_recipe,
-    }
+    assert plan._impl.quant_modes == {"w4a16", larger_recipe}
     w1 = torch.empty((8, 256, 64), dtype=torch.uint8)
     w2 = torch.empty((8, 128, 64), dtype=torch.uint8)
     experts = fused_moe.PreparedExperts(
@@ -152,7 +127,7 @@ def test_a16_cutoff_uses_existing_precision_candidates(mode, larger_recipe):
         assert configs
         if rows <= 32:
             assert all(config.backend == "w4a16" for config in configs)
-        elif mode != "auto":
+        else:
             assert all(config.backend != "w4a16" for config in configs)
 
 
@@ -224,7 +199,7 @@ def test_uniform_nvfp4_a16_does_not_retain_source_scales():
     ),
 )
 @pytest.mark.parametrize("counts", ((1, 2, 4, 7, 8), (1, 2, 3, 4, 5, 6, 8)))
-def test_auto_native_decode_retains_launches_and_replays_shared_storage(
+def test_a16_cutoff_native_decode_retains_launches_and_replays_shared_storage(
     tmp_path,
     monkeypatch,
     num_experts,
@@ -253,7 +228,10 @@ def test_auto_native_decode_retains_launches_and_replays_shared_storage(
     plan = fused_moe.plan_weights(
         source=fused_moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
         activation=fused_moe.ActivationSpec(
-            mode="auto", nonlinearity="silu", io_dtype=torch.bfloat16
+            mode="a4",
+            nonlinearity="silu",
+            io_dtype=torch.bfloat16,
+            a16_max_tokens=8,
         ),
         geometry=fused_moe.MoEGeometry(
             num_experts=num_experts,
@@ -312,11 +290,10 @@ def test_auto_native_decode_retains_launches_and_replays_shared_storage(
                 topk_weights=probabilities[:m],
                 output=torch.empty_like(x[:m]),
             )
-            assert (
-                state.config.backend == "w4a16"
-                and state.config.w4a16_route_mode == "direct"
+            assert state.config.backend == "w4a16"
+            assert (binding.route_pack_launches is None) is (
+                state.config.w4a16_route_mode == "direct"
             )
-            assert binding.route_pack_launches is None
             return PreparedCall(run=lambda: state.run(binding), owners=scratch)
 
         return call
@@ -327,19 +304,20 @@ def test_auto_native_decode_retains_launches_and_replays_shared_storage(
         session.prepare(
             (
                 execution.request(
-                    name="native-auto",
+                    name="native-a16-cutoff",
                     prepare_calls={m: make_call(m) for m in counts},
                 ),
             )
         )
         bindings = []
+        expected_direct_launches = set()
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+            for spec in execution.scratch_specs()
+        )
         unprepared_rows = next(rows for rows in range(1, 8) if rows not in counts)
         for m in (*counts, unprepared_rows):
             state = execution.variants[m if m in counts else 8].prepared.state
-            scratch = tuple(
-                torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-                for spec in state.scratch.scratch_specs()
-            )
             for dtype in (torch.int32, torch.int64):
                 binding = fused_moe.bind(
                     execution,
@@ -349,11 +327,14 @@ def test_auto_native_decode_retains_launches_and_replays_shared_storage(
                     topk_weights=probabilities[:m],
                     output=torch.empty_like(x[:m]),
                 )
-                assert (binding.route_pack_launches is None) is (m in counts)
+                direct = state.config.w4a16_route_mode == "direct"
+                assert (binding.route_pack_launches is None) is direct
+                if direct:
+                    expected_direct_launches.add((m, dtype))
                 bindings.append((m, binding, scratch))
 
         launched = []
-        launch_flat = w4a16_direct_launch._w4a16_small_m_direct_launch_flat
+        launch_flat = w4a16_execution._w4a16_small_m_direct_launch_flat
 
         def retained_launch(*args, launcher=None, **kwargs):
             assert launcher is not None
@@ -373,7 +354,10 @@ def test_auto_native_decode_retains_launches_and_replays_shared_storage(
             w4a16_fused_launch, "compile_w4a16_fused_moe", forbidden_resolution
         )
         monkeypatch.setattr(
-            w4a16_direct_launch, "_w4a16_small_m_direct_launch_flat", retained_launch
+            w4a16_execution, "compile_w4a16_fused_moe", forbidden_resolution
+        )
+        monkeypatch.setattr(
+            w4a16_execution, "_w4a16_small_m_direct_launch_flat", retained_launch
         )
         session.freeze()
         for m, binding, scratch in bindings:
@@ -422,9 +406,8 @@ def test_auto_native_decode_retains_launches_and_replays_shared_storage(
                 assert torch.isfinite(actual).all()
                 assert compare_to_reference(actual, expected).cos > 0.9999
             graph.reset()
-        assert set(launched) == {
-            (m, dtype) for m in counts for dtype in (torch.int32, torch.int64)
-        }
+        assert expected_direct_launches
+        assert set(launched) == expected_direct_launches
         for tensor, original in zip(raw, originals):
             torch.testing.assert_close(
                 tensor.view(torch.uint8), original.view(torch.uint8), rtol=0, atol=0

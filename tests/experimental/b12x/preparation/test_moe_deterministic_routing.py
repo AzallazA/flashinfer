@@ -29,9 +29,10 @@ def _qwen_query(tokens, deterministic, mode="nvfp4"):
     weights = moe.plan_weights(
         source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
         activation=moe.ActivationSpec(
-            mode="a4" if mode == "nvfp4" else "auto",
+            mode="a4",
             nonlinearity="silu",
             io_dtype=torch.bfloat16,
+            a16_max_tokens=8 if mode == "multi" else 0,
         ),
         geometry=moe.MoEGeometry(
             num_experts=512, hidden_size=2560, intermediate_size=640
@@ -71,7 +72,7 @@ def _qwen_query(tokens, deterministic, mode="nvfp4"):
     return query, native
 
 
-@pytest.mark.parametrize("mode", ("nvfp4", "multi", "nvfp4_auto"))
+@pytest.mark.parametrize("mode", ("nvfp4", "multi"))
 @pytest.mark.parametrize("deterministic", (True, False))
 @pytest.mark.parametrize("tokens", CAPACITIES)
 def test_qwen_candidates_lower_through_native_route_compiler(
@@ -98,7 +99,7 @@ def test_qwen_candidates_lower_through_native_route_compiler(
     assert not torch.cuda.is_initialized()
 
 
-@pytest.mark.parametrize("mode", ("nvfp4", "multi", "nvfp4_auto"))
+@pytest.mark.parametrize("mode", ("nvfp4", "multi"))
 @pytest.mark.parametrize("deterministic", (True, False))
 @pytest.mark.parametrize("tokens", (1, 8, 4096))
 def test_memory_query_matches_scratch_binding(tokens, deterministic, mode, monkeypatch):
@@ -120,7 +121,7 @@ def test_memory_query_matches_scratch_binding(tokens, deterministic, mode, monke
 
 
 @pytest.mark.parametrize("route", ("direct", "triton"))
-@pytest.mark.parametrize("mode", ("nvfp4", "multi", "nvfp4_auto"))
+@pytest.mark.parametrize("mode", ("nvfp4", "multi"))
 def test_explicit_deterministic_route_overrides_reject_before_planning(route, mode):
     query, _ = _qwen_query(1, True, mode)
     config = MoeDecodeConfig(
