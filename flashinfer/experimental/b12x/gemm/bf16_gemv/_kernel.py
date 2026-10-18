@@ -586,7 +586,6 @@ def compile_projection(
         y_type,
     )
     key = (
-        ordinal,
         backend,
         rows_per_tile if backend == "simt" else None,
         block_threads if backend == "simt" else None,
