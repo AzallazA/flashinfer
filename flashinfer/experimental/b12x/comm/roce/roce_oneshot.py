@@ -246,7 +246,8 @@ class RoceOneshotAllReduce:
         ``ring=True`` connects only neighbors in rank order (2..16 ranks),
         forwarding other writes through bounded native RDMA mailboxes along
         the shorter path. Every rank must select the same mode. The proxy owns
-        about 2.01 MiB of additional registered host memory, allocated at setup.
+        about 1 MiB of additional registered host memory per rank in the world
+        (8.0 MiB at eight ranks), allocated at setup.
         This is a software relay, not ConnectX hardware hairpin forwarding.
 
         ``pipe_bytes`` (default 0: none) sizes the pipelined two-shot path, which

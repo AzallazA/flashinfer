@@ -42,25 +42,29 @@ can perform that exchange without requiring an NCCL data transport.
 One-shot reductions, two-shot reductions, fixed gathers, and variable-length
 gathers share the same native write path. Non-neighbor transfers use the
 shorter direction around the ring; equal distances choose increasing ranks.
-Relays split each rail into at most 64 KiB packets, with one packet per original
-sender per rail in flight. Each sender has private mailbox credit at every
-relay. Acknowledgments propagate back only after the downstream transfer has
-finished reading its source, preserving staging lifetimes without circular
-credit dependencies between senders.
+Relays split each rail into at most 64 KiB packets. Each original sender owns
+eight mailbox slots per rail at every rank, so up to eight packets per sender
+and rail are in flight, and it reuses a slot only after the end-to-end
+acknowledgment of the packet that last used it. Acknowledgments propagate back
+only after the downstream transfer has finished reading its source, preserving
+staging lifetimes without circular credit dependencies between senders. The
+sender's payload is read only by its first-hop write, so its lifetime follows
+the same completion rules as a direct write.
 
-The proxy owns approximately 2.01 MiB of extra registered host memory per rank,
-allocated before connection exchange. No relay allocation or Python callback
-occurs during replay. Existing captured buffers and kernel layouts are retained.
-Proxy ABI 9 extends the connection blob; native consumers must use the matching
-C source and call `roce_enable_ring` before exchanging blobs. The returned
-`native_description()` records `ring`; private mailbox addresses are exchanged
-fresh at startup rather than restored from a CUDA graph.
+The proxy owns about 1 MiB of extra registered host memory per rank in the
+world (8.0 MiB at eight ranks, 16.1 MiB at sixteen), allocated before connection
+exchange. No relay allocation or Python callback occurs during replay. Existing
+captured buffers and kernel layouts are retained. Proxy ABI 10 extends the
+connection blob and sizes the mailbox region; native consumers must use the
+matching C source and call `roce_enable_ring` before exchanging blobs. The
+returned `native_description()` records `ring`; private mailbox addresses are
+exchanged fresh at startup rather than restored from a CUDA graph.
 
 Collective generations range from 1 through 2,147,483,647. The proxy fails
 with `RoCE sequence space exhausted` before dispatching a larger generation;
 recreate every rank's runtime to reset the sequence. The bound preserves the
 meaning of zero-initialized chunk-ready words and the healthy error sentinel.
-It applies to the direct and ring transports without changing proxy ABI 9.
+It applies to the direct and ring transports and does not change the proxy ABI.
 
 ## Runnable checks
 
@@ -145,7 +149,23 @@ A separate four-rank GPU negative control removed only the two-shot
 matching graph passed with the wait present. The wait therefore remains part
 of the send-buffer lifetime contract.
 
-Actual switchless cabling, full-model ring serving, and ring performance remain
-unqualified. These finite tests do not establish progress under every possible
-failure or scheduling pattern. CPU relays add overhead; throughput and latency
-depend on the topology and workload.
+On eight DGX Sparks cabled directly in a ring (each ConnectX-7 port to one
+neighbor, two PCIe functions per port), the native validator passed 1000 mixed
+operations per rank with one rank delayed, and the GPU graph replay test above
+passed with eight ranks. Every byte and BF16 sum matched, each rank connected
+only its two neighbors, and every rank forwarded traffic.
+
+On the same ring, a CPU-driven timing loop (each rank rings the doorbell and
+waits for every peer's flags; median over 500 operations, slowest rank) measured:
+
+| Operation | Payload | Time |
+| --- | ---: | ---: |
+| One-shot | 32 B | 27 us |
+| One-shot | 64 KiB | 72 us |
+| One-shot | 1 MiB | 1.3 ms |
+| Two-shot | 16 MiB | 5.0 ms |
+
+Full-model ring serving and ring performance under a model remain unqualified.
+These finite tests do not establish progress under every possible failure or
+scheduling pattern. CPU relays add overhead that depends on host load, topology
+and workload.
