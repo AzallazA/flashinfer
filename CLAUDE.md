@@ -788,7 +788,9 @@ parameters or compiler options. Computed imports in implementation modules
 declare local targets in `__b12x_source_dependencies__`. Shared helpers live in
 leaf modules under `_lib/intrinsics/`, `_lib/utils/`, `_lib/dense_gemm/`, and
 `moe/_shared/kernels/`; consumers import the defining module to keep dependency
-closures narrow. Source and compiler configuration are process-immutable:
+closures narrow. Callable source discovery is cached by function or class,
+including the owner class for bound methods, and cleared by
+`clear_compile_cache()`. Source and compiler configuration are process-immutable:
 restart after editing code or changing compiler defaults. Warm in-memory hits
 and prepared CUDA graph replay do not read or parse source files.
 

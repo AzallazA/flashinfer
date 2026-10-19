@@ -33,7 +33,8 @@ from .race_fuzz import install_from_environment as _install_race_fuzz
 apply_cutlass_runtime_patches()
 
 # Source dependencies use canonical module names within this package.
-_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+_COMPILER_SOURCE = Path(__file__).resolve()
+_PACKAGE_ROOT = _COMPILER_SOURCE.parents[1]
 _MEMORY_CACHE: OrderedDict[object, Any] = OrderedDict()
 _MEMORY_CACHE_LOCK = RLock()
 register_program_cache(_MEMORY_CACHE, lock=_MEMORY_CACHE_LOCK)
@@ -1501,7 +1502,7 @@ def _device_compile_cache_context(compile_callable: Any) -> tuple[object, ...]:
 def _target_source_fingerprint(func: Any) -> str:
     roots = (
         *callable_sources(func, _PACKAGE_ROOT),
-        ("b12x._lib.compiler", Path(__file__).resolve()),
+        ("b12x._lib.compiler", _COMPILER_SOURCE),
         ("b12x._lib.runtime_patches", _PACKAGE_ROOT / "_lib" / "runtime_patches.py"),
     )
     return source_dependencies(_PACKAGE_ROOT).fingerprint(roots)

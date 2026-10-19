@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import sys
+import weakref
 
 
 SOURCE = (
@@ -19,6 +20,8 @@ spec.loader.exec_module(dependencies)
 
 class SourceDependencyTests(unittest.TestCase):
     def setUp(self):
+        dependencies.source_dependencies.cache_clear()
+        self.addCleanup(dependencies.source_dependencies.cache_clear)
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
@@ -164,6 +167,70 @@ class SourceDependencyTests(unittest.TestCase):
         for value in (target, target.__call__):
             roots = dependencies.callable_sources(value, self.root)
             self.assertEqual({name for name, _ in roots}, {"b12x.kernel", "b12x.base"})
+        base = sys.modules["b12x.base"].Base()
+        roots = dependencies.callable_sources(base.__call__, self.root)
+        self.assertEqual({name for name, _ in roots}, {"b12x.base"})
+
+    def test_callable_memo_shares_instances_without_retaining_them(self):
+        self.write(
+            "kernel.py",
+            "class Kernel:\n __hash__ = None\n def __call__(self): return 1\n",
+        )
+        kernel = self.load("b12x.kernel", "kernel.py").Kernel
+        for bound in (False, True):
+            target = kernel()
+            reference = weakref.ref(target)
+            roots = dependencies.callable_sources(
+                target.__call__ if bound else target, self.root
+            )
+            del target
+            self.assertIsNone(reference())
+            with (
+                patch.object(dependencies.inspect, "getsourcefile") as inspect_source,
+                patch.object(Path, "resolve") as resolve,
+            ):
+                target = kernel()
+                self.assertEqual(
+                    roots,
+                    dependencies.callable_sources(
+                        target.__call__ if bound else target, self.root
+                    ),
+                )
+                inspect_source.assert_not_called()
+                resolve.assert_not_called()
+
+    def test_callable_memo_distinguishes_closures_with_the_same_name(self):
+        self.write("first.py", "def helper(): return 1\n")
+        self.write("second.py", "def helper(): return 2\n")
+        self.write(
+            "kernel.py",
+            "def make(callback):\n def kernel(): return callback()\n return kernel\n",
+        )
+        make = self.load("b12x.kernel", "kernel.py").make
+        for module in ("first", "second"):
+            helper = self.load(f"b12x.{module}", f"{module}.py").helper
+            target = make(helper)
+            roots = dependencies.callable_sources(target, self.root)
+            self.assertEqual(
+                {name for name, _ in roots}, {"b12x.kernel", f"b12x.{module}"}
+            )
+            with patch.object(dependencies.inspect, "getsourcefile") as inspect_source:
+                self.assertEqual(
+                    roots, dependencies.callable_sources(target, self.root)
+                )
+                inspect_source.assert_not_called()
+
+    def test_clearing_source_cache_rediscovers_callable_defaults(self):
+        self.write("helper.py", "def helper(): return 1\n")
+        helper = self.load("b12x.helper", "helper.py").helper
+        self.write("kernel.py", "def kernel(callback=None): return callback()\n")
+        kernel = self.load("b12x.kernel", "kernel.py").kernel
+        roots = dependencies.callable_sources(kernel, self.root)
+        self.assertEqual({name for name, _ in roots}, {"b12x.kernel"})
+        kernel.__defaults__ = (helper,)
+        dependencies.source_dependencies.cache_clear()
+        roots = dependencies.callable_sources(kernel, self.root)
+        self.assertEqual({name for name, _ in roots}, {"b12x.kernel", "b12x.helper"})
 
     def test_lazy_reexport_need_not_cache_its_attribute(self):
         self.write("helpers/leaf.py", "def run(): return 1\n")

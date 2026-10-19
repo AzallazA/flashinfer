@@ -35,7 +35,10 @@ def callable_source(target):
 
 def callable_sources(target, root: Path):
     """Include local wrappers, inherited methods and callable defaults/closures."""
-    root = root.resolve()
+    return source_dependencies(root).callable_sources(target)
+
+
+def _discover_callable_sources(target, root: Path):
     pending = [target]
     seen = set()
     roots = set()
@@ -155,7 +158,7 @@ class SourceDependencies:
     Package initializers contribute their source and selected re-exports, not
     their entire lazy API registry. Computed imports in implementation modules
     declare their possible local targets in ``__b12x_source_dependencies__``.
-    Source is immutable for the lifetime of this object.
+    Source and callable structure are immutable for the lifetime of this object.
     """
 
     def __init__(self, root: Path):
@@ -163,6 +166,24 @@ class SourceDependencies:
         self._files = {}
         self._closures = {}
         self._digests = {}
+        self._callables = {}
+
+    def callable_sources(self, target):
+        if inspect.ismethod(target):
+            owner = (
+                target.__self__
+                if inspect.isclass(target.__self__)
+                else type(target.__self__)
+            )
+            key = (target.__func__, owner)
+        elif inspect.isfunction(target) or inspect.isclass(target):
+            key = (target,)
+        else:
+            # Instance state specializes compilation, not the source dependency set.
+            key = (None, type(target))
+        if key not in self._callables:
+            self._callables[key] = _discover_callable_sources(target, self.root)
+        return self._callables[key]
 
     def module_path(self, module: str) -> Path | None:
         module = canonical_module(module)

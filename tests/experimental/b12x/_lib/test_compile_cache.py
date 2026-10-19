@@ -21,6 +21,26 @@ def test_package_root_is_the_b12x_package():
     assert (root / "_lib" / "compiler.py").is_file()
 
 
+def test_clear_compile_cache_resets_source_discovery(monkeypatch):
+    from b12x._lib import source_dependencies
+
+    compiler.clear_compile_cache()
+    discover = source_dependencies._discover_callable_sources
+    calls = []
+
+    def tracked(*args):
+        calls.append(args)
+        return discover(*args)
+
+    monkeypatch.setattr(source_dependencies, "_discover_callable_sources", tracked)
+    before = compiler._target_source_fingerprint(compiler.compile)
+    assert compiler._target_source_fingerprint(compiler.compile) == before
+    assert len(calls) == 1
+    compiler.clear_compile_cache()
+    assert compiler._target_source_fingerprint(compiler.compile) == before
+    assert len(calls) == 2
+
+
 def test_cache_dir_resolution_order(monkeypatch):
     for name in ("B12X_COMPILE_CACHE_DIR", "XDG_CACHE_HOME"):
         monkeypatch.delenv(name, raising=False)
