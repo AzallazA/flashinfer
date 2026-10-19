@@ -2462,6 +2462,25 @@ def top_k_top_p_sampling_from_probs(
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
 
 
+def _top_p_renorm_workspace_size(batch_size, vocab_size, is_deterministic):
+    """Return the byte capacity consumed by the AIR top-p native workspace."""
+    # Workspace size for AIR Top-P radix algorithm.
+    # Match AirTopPRenormProb's workspace partition in air_top_p.cuh.
+    align256 = lambda x: ((x + 255) // 256) * 256
+    counter_size = 384  # sizeof(Counter<float>) with alignas(128) members
+    # buf_len = alignTo(vocab_size / (ratio * 8), 256), ratio = 4 for float32
+    buf_len = max(align256(vocab_size // 32), 256)
+    hist_entry_size = 8 if is_deterministic else 4  # uint64 vs float
+    ws_size = (
+        align256(counter_size * batch_size)  # counters
+        + align256(hist_entry_size * 2048 * batch_size)  # histogram
+        + align256(4 * 2048 * batch_size)  # countHistogram
+        + align256(4 * buf_len * batch_size)  # buf1
+        + align256(4 * buf_len * batch_size)  # buf2
+    )
+    return ws_size
+
+
 @flashinfer_api(trace=top_p_renorm_probs_trace)
 def top_p_renorm_probs(
     probs: torch.Tensor,
@@ -2529,20 +2548,7 @@ def top_p_renorm_probs(
     """
     batch_size = probs.size(0)
     vocab_size = probs.size(1)
-    # Workspace size for AIR Top-P radix algorithm.
-    # Must match GetAirTopPRenormWorkspaceSize in air_top_p.cuh.
-    align256 = lambda x: ((x + 255) // 256) * 256
-    counter_size = 384  # sizeof(Counter<float>) with alignas(128) members
-    # buf_len = alignTo(vocab_size / (ratio * 8), 256), ratio = 4 for float32
-    buf_len = max(align256(vocab_size // 32), 256)
-    hist_entry_size = 8 if is_deterministic else 4  # uint64 vs float
-    ws_size = (
-        align256(counter_size * batch_size)  # counters
-        + align256(hist_entry_size * 2048 * batch_size)  # histogram
-        + align256(4 * 2048 * batch_size)  # countHistogram
-        + align256(4 * buf_len * batch_size)  # buf1
-        + align256(4 * buf_len * batch_size)  # buf2
-    )
+    ws_size = _top_p_renorm_workspace_size(batch_size, vocab_size, is_deterministic)
     workspace = torch.empty(ws_size, dtype=torch.uint8, device=probs.device)
     return get_sampling_module().top_p_renorm_probs(
         probs, *_to_tensor_scalar_tuple(top_p), is_deterministic, workspace
