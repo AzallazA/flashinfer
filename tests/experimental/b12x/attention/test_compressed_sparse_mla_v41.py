@@ -139,7 +139,7 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
         mode=mode,
         max_chunks_per_row=4,
         use_cuda_graph=True,
-        v41_compute_mode=arithmetic,
+        compute_mode=arithmetic,
     )
     output = torch.empty_like(q)
     invocation = compressed_sparse_mla.invocation_from_tensors(
@@ -179,7 +179,7 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
     cache_snapshot = None
     if arithmetic == "bf16":
         assert plan.override is None
-        assert plan.query.v41_compute_mode == "bf16"
+        assert plan.query.compute_mode == "bf16"
         assert plan.selection.config.v41_compute_mode == "bf16"
         assert plan.selection.source != "override"
         cache_snapshot = (swa_cache.clone(), indexed_cache.clone())

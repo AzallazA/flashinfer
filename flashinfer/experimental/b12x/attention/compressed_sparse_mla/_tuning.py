@@ -55,13 +55,13 @@ class SparseMlaQuery:
     return_lse: bool
     lse_scale: str
     output_mode: str
-    v41_compute_mode: str = "auto"
+    compute_mode: str = "auto"
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
-        if self.v41_compute_mode == "auto":
+        if self.compute_mode == "auto":
             # Unconstrained declarations retain their query codec and cache identity.
-            del payload["v41_compute_mode"]
+            del payload["compute_mode"]
         return payload
 
 
@@ -148,7 +148,7 @@ def _default_config(
 ) -> SparseMlaConfig:
     single_pass = _single_pass(query, device)
     split = None if single_pass else _split_config(query, 256)
-    compute_mode = "fp8" if query.v41_compute_mode == "auto" else query.v41_compute_mode
+    compute_mode = "fp8" if query.compute_mode == "auto" else query.compute_mode
     return SparseMlaConfig(
         max_chunks_per_row=1 if split is None else split.num_chunks,
         split_chunk_size=1 if split is None else split.chunk_size,
@@ -172,10 +172,10 @@ def _validate_query(query: SparseMlaQuery, _device: DeviceIdentity | None) -> No
         raise ValueError("compressed MLA requires the compressed_dsv4 layout")
     if query.cache_format not in ("deepseek_v4", "deepseek_v41"):
         raise ValueError("unsupported compressed MLA cache_format")
-    if query.v41_compute_mode not in ("auto", "bf16"):
-        raise ValueError("v41_compute_mode must be 'auto' or 'bf16'")
-    if query.v41_compute_mode != "auto" and query.cache_format != "deepseek_v41":
-        raise ValueError("V4.1 arithmetic constraints require the V4.1 cache format")
+    if query.compute_mode not in ("auto", "bf16"):
+        raise ValueError("compute_mode must be 'auto' or 'bf16'")
+    if query.compute_mode != "auto" and query.cache_format != "deepseek_v41":
+        raise ValueError("compute_mode='bf16' requires cache_format='deepseek_v41'")
     if query.mode not in ("decode", "extend", "verify", "draft_extend"):
         raise ValueError("unsupported compressed MLA mode")
     expected_kv_dtype = "uint8" if query.cache_format == "deepseek_v41" else None
@@ -224,10 +224,7 @@ def _validate_config(
         raise ValueError("compressed MLA config path does not match the declared query")
     if config.v41_compute_mode not in ("bf16", "fp8"):
         raise ValueError("v41_compute_mode must be 'bf16' or 'fp8'")
-    if (
-        query.v41_compute_mode != "auto"
-        and config.v41_compute_mode != query.v41_compute_mode
-    ):
+    if query.compute_mode != "auto" and config.v41_compute_mode != query.compute_mode:
         raise ValueError(
             "compressed MLA configuration violates its arithmetic constraint"
         )
@@ -267,9 +264,7 @@ def _parameters(
         head_blocks = (default.v41_heads_per_block,)
     else:
         modes = (
-            ("fp8", "bf16")
-            if query.v41_compute_mode == "auto"
-            else (query.v41_compute_mode,)
+            ("fp8", "bf16") if query.compute_mode == "auto" else (query.compute_mode,)
         )
         head_blocks = (8, 16)
     return {
@@ -293,7 +288,7 @@ TUNING = TuningContract(
     component_id="attention.compressed_sparse_mla",
     query_schema_version=22,
     config_schema_version=22,
-    query_fields=frozenset(SparseMlaQuery.__dataclass_fields__) - {"v41_compute_mode"},
+    query_fields=frozenset(SparseMlaQuery.__dataclass_fields__) - {"compute_mode"},
     config_fields=frozenset(SparseMlaConfig.__dataclass_fields__),
     encode_query=SparseMlaQuery.to_dict,
     encode_config=asdict,
@@ -324,14 +319,14 @@ TUNING = TuningContract(
 
 _ARITHMETIC_TUNING = replace(
     TUNING,
-    query_schema_version=23,
+    query_schema_version=24,
     query_fields=frozenset(SparseMlaQuery.__dataclass_fields__),
 )
 
 
 def contract_for_query(query: SparseMlaQuery) -> TuningContract:
     """Select the constrained query codec without changing unconstrained cache keys."""
-    return TUNING if query.v41_compute_mode == "auto" else _ARITHMETIC_TUNING
+    return TUNING if query.compute_mode == "auto" else _ARITHMETIC_TUNING
 
 
 __all__ = ["SparseMlaConfig", "SparseMlaQuery", "TUNING", "contract_for_query"]

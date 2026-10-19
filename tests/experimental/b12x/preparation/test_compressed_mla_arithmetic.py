@@ -21,7 +21,7 @@ DEVICE = DeviceIdentity("nvidia", (12, 0), 188, "SM120")
 def declaration(*, heads=16, mode="decode", indexed=False, arithmetic=None):
     q = torch.empty((3, heads, 512), dtype=torch.bfloat16)
     cache = torch.empty((2, 64 * 528), dtype=torch.uint8)
-    options = {} if arithmetic is None else {"v41_compute_mode": arithmetic}
+    options = {} if arithmetic is None else {"compute_mode": arithmetic}
     caps = mla.Caps(
         device="cpu",
         num_q_heads=heads,
@@ -71,11 +71,14 @@ def test_bf16_restricts_arithmetic_and_retains_other_tuning_domains(
     assert auto_domains.pop("v41_compute_mode") == ("fp8", "bf16")
     assert domains == auto_domains
     encoded = constrained.contract.encode_query(constrained.query)
-    assert encoded["v41_compute_mode"] == "bf16"
+    assert constrained.contract.query_schema_version == 24
+    assert "compute_mode" in constrained.contract.query_fields
+    assert "v41_compute_mode" not in encoded
+    assert encoded["compute_mode"] == "bf16"
     assert SparseMlaQuery(**encoded) == constrained.query
     assert _declaration_key(auto) != _declaration_key(constrained)
     restored = _caps(constrained.query, configuration.default, 0)
-    assert restored.v41_compute_mode == "bf16"
+    assert restored.compute_mode == "bf16"
     assert restored.kv_dtype == torch.uint8
     for field in (
         "kv_dtype",
@@ -95,7 +98,7 @@ def test_auto_retains_default_candidates_and_query_cache_identity(heads, mode):
     assert implicit.contract is TUNING and explicit.contract is TUNING
     assert TUNING.query_schema_version == 22
     legacy_payload = asdict(implicit.query)
-    del legacy_payload["v41_compute_mode"]
+    del legacy_payload["compute_mode"]
     assert implicit.contract.encode_query(implicit.query) == legacy_payload
     legacy = replace(implicit, query=SparseMlaQuery(**legacy_payload))
     assert _declaration_key(implicit) == _declaration_key(legacy)
@@ -191,17 +194,17 @@ def test_caps_rejects_unsupported_arithmetic_constraints(arithmetic):
             max_q_rows=3,
             max_width=128,
             cache_format="deepseek_v41",
-            v41_compute_mode=arithmetic,
+            compute_mode=arithmetic,
         )
 
 
 def test_bf16_constraint_requires_mixed_v41_cache_format():
-    with pytest.raises(ValueError, match="V4.1 cache format"):
+    with pytest.raises(ValueError, match="requires cache_format='deepseek_v41'"):
         mla.Caps(
             device="cpu",
             num_q_heads=16,
             max_q_rows=3,
             max_width=128,
             cache_format="deepseek_v4",
-            v41_compute_mode="bf16",
+            compute_mode="bf16",
         )

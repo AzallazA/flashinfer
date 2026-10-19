@@ -215,7 +215,7 @@ def _query(
         return_lse=bool(invocation["return_lse"]),
         lse_scale=str(invocation["lse_scale"]),
         output_mode=str(invocation["output_mode"]),
-        v41_compute_mode=caps.v41_compute_mode,
+        compute_mode=caps.compute_mode,
     )
 
 
@@ -246,7 +246,7 @@ def _caps(
         swa_page_size=query.swa_page_size,
         indexed_page_size=query.indexed_page_size,
         use_cuda_graph=query.use_cuda_graph,
-        v41_compute_mode=query.v41_compute_mode,
+        compute_mode=query.compute_mode,
     )
 
 
@@ -562,7 +562,7 @@ def compile_compressed_sparse_mla(query_payload, config_payload, ordinal):
     query = SparseMlaQuery(**dict(query_payload))
     config = SparseMlaConfig.from_config(FrozenMapping(config_payload))
     TUNING.validate_query(query, None)
-    if query.v41_compute_mode != "auto":
+    if query.compute_mode != "auto":
         TUNING.validate_config(query, config, None)
     launch = _lower_launch(query, config, ordinal)
     mapper = _lower_indexed_mapper(query, config, ordinal)
