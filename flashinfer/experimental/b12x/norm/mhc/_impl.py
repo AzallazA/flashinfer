@@ -20,6 +20,7 @@ from b12x._lib.scratch_layout import (
 )
 from b12x.preparation.types import Plan, plan_from_handle, require_prepared
 from ._tuning import MhcConfig, MhcQuery
+from ._alias import overlaps
 
 MHC_MULT = 4
 MHC_MIXES = (2 + MHC_MULT) * MHC_MULT
@@ -691,11 +692,11 @@ def _lagged_mix_views(
         name="pre_out",
     )
     assert pre_out is not None
-    if torch._C._overlaps(pre_mix, pre_out):
+    if overlaps(pre_mix, pre_out):
         raise ValueError("pre_mix and pre_out must not alias; use ping-pong buffers")
     for tensor in (*outputs, *inputs):
         if tensor is not None and (
-            torch._C._overlaps(pre_mix, tensor) or torch._C._overlaps(pre_out, tensor)
+            overlaps(pre_mix, tensor) or overlaps(pre_out, tensor)
         ):
             raise ValueError(
                 "lagged MHC coefficient buffers must not alias inputs, outputs, or scratch"
@@ -704,7 +705,7 @@ def _lagged_mix_views(
 
 
 def _validate_lagged_y_output(y, tensors):
-    if any(tensor is not None and torch._C._overlaps(y, tensor) for tensor in tensors):
+    if any(tensor is not None and overlaps(y, tensor) for tensor in tensors):
         raise ValueError(
             "lagged mHC y output must not alias inputs, residual output, or scratch"
         )

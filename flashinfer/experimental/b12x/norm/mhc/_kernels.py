@@ -44,6 +44,7 @@ from b12x._lib.intrinsics.memory import (
 )
 from b12x._lib.intrinsics.atomics import st_shared_u32
 from b12x._lib.utils.device import current_cuda_stream
+from ._alias import overlaps
 
 _PREFILL_TF32_TMA_LONG_4096_K_SPLITS = (
     None  # placeholder: undefined in the b12x migration; set the real value
@@ -135,9 +136,7 @@ def _run_mhc_collapse_launch(
     *,
     _prepared=None,
 ):
-    if torch._C._overlaps(state, out) or (
-        pre_mix is not None and torch._C._overlaps(pre_mix, out)
-    ):
+    if overlaps(state, out) or (pre_mix is not None and overlaps(pre_mix, out)):
         raise ValueError("collapse out must not alias state or pre_mix")
     tokens, _, hidden = state.shape
     if not tokens:
