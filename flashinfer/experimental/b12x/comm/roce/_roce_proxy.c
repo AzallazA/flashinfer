@@ -210,6 +210,12 @@ typedef struct {
   uint64_t ring_serial[ROCE_MAX_RAILS];
   uint64_t ring_seen[ROCE_MAX_PEERS][ROCE_MAX_RAILS][RING_WINDOW];
   int ring_pending[ROCE_MAX_PEERS][ROCE_MAX_RAILS][RING_WINDOW];
+  // Validated copies of each in-flight mailbox's target and previous hop. The
+  // mailbox is remote-writable, so completions index by these, never by the
+  // descriptor as it reads later.
+  uint8_t ring_target[ROCE_MAX_PEERS][ROCE_MAX_RAILS][RING_WINDOW];
+  uint8_t ring_previous[ROCE_MAX_PEERS][ROCE_MAX_RAILS][RING_WINDOW];
+  uint64_t ring_inflight[ROCE_MAX_PEERS][ROCE_MAX_RAILS][RING_WINDOW];
   uint64_t ring_forwarded;
   char err[512];
 } roce_ctx_t;
@@ -613,7 +619,7 @@ static int drain_cq(roce_ctx_t* c, int h) {
     int src = (int)((wc[i].wr_id >> 16) & 255);
     int slot = (int)((wc[i].wr_id >> 8) & 255);
     int rail = (int)(wc[i].wr_id & 255);
-    int peer = relayed ? (int)ring_inbox(c, src, rail, slot)->descriptor.target : (int)wc[i].wr_id;
+    int peer = relayed ? (int)c->ring_target[src][rail][slot] : (int)wc[i].wr_id;
     if (wc[i].status != IBV_WC_SUCCESS) {
       snprintf(c->err, sizeof(c->err), "RDMA write to rank %u failed: %s (vendor_err 0x%x, seq %u)",
                (unsigned)peer, ibv_wc_status_str(wc[i].status), wc[i].vendor_err, c->last_seq);
@@ -657,10 +663,9 @@ static int reserve(roce_ctx_t* c, int h, int p) {
 // decreases at every hop. Its header and payload remain live until the
 // downstream ack.
 static int ring_complete(roce_ctx_t* c, int origin, int rail, int slot) {
-  ring_descriptor_t* d = &ring_inbox(c, origin, rail, slot)->descriptor;
-  int previous = (int)d->previous;
+  int previous = (int)c->ring_previous[origin][rail][slot];
   int h = c->rail_hca[previous][rail];
-  uint64_t serial = d->serial;
+  uint64_t serial = c->ring_inflight[origin][rail][slot];
   struct ibv_sge sge = {.addr = (uintptr_t)&serial, .length = 8};
   struct ibv_send_wr wr = {0}, *bad = NULL;
   wr.wr_id = (uint64_t)previous;
@@ -685,7 +690,9 @@ static int ring_complete(roce_ctx_t* c, int origin, int rail, int slot) {
 
 // The caller reserves queue capacity; this function never progresses another
 // packet recursively. In particular a forwarding mailbox is marked pending
-// before any subsequent progress call can inspect it again.
+// before any subsequent progress call can inspect it again. Returns 1 when the
+// slot's next packet has not arrived or cannot be posted yet, so the caller
+// holds every later serial of that sender and rail.
 static int ring_submit(roce_ctx_t* c, int origin, int rail, int slot, int next,
                        const uint8_t* payload, uint32_t lkey, const ring_descriptor_t* descriptor) {
   int h = c->rail_hca[next][rail];
@@ -693,8 +700,7 @@ static int ring_submit(roce_ctx_t* c, int origin, int rail, int slot, int next,
   *d = *descriptor;
   d->previous = (uint64_t)c->rank;
   uint64_t serial = d->serial;
-  uint64_t mailbox =
-      c->ring_addr[next] + ring_inbox_offset(ring_slot(origin, rail, slot));
+  uint64_t mailbox = c->ring_addr[next] + ring_inbox_offset(ring_slot(origin, rail, slot));
   struct ibv_sge data = {.addr = (uintptr_t)payload, .length = (uint32_t)d->nbytes, .lkey = lkey};
   struct ibv_sge header = {
       .addr = (uintptr_t)d + 8, .length = sizeof(*d) - 8, .lkey = c->ring_mr[h]->lkey};
@@ -746,11 +752,12 @@ static int ring_service_slot(roce_ctx_t* c, int origin, int rail, int slot) {
     return 0;
   }
   uint64_t seen = c->ring_seen[origin][rail][slot];
-  if (serial == seen || *pending) return 0;
+  if (serial == seen) return 1;
+  if (*pending) return 0;
   int target = (int)d->target, previous = (int)d->previous;
   if (serial < seen || (serial - 1) % RING_WINDOW != (uint64_t)slot ||
-      d->target >= (uint64_t)c->world || d->previous >= (uint64_t)c->world ||
-      previous == c->rank || ring_relayed(c, previous) || target == c->rank ||
+      d->target >= (uint64_t)c->world || d->previous >= (uint64_t)c->world || previous == c->rank ||
+      ring_relayed(c, previous) || target == c->rank ||
       ring_distance(previous, target, c->world) != ring_distance(c->rank, target, c->world) + 1 ||
       d->nbytes > RING_CHUNK_BYTES || d->offset > c->region_bytes ||
       d->nbytes > c->region_bytes - d->offset ||
@@ -760,12 +767,14 @@ static int ring_service_slot(roce_ctx_t* c, int origin, int rail, int slot) {
              rail, slot);
     return -1;
   }
+  c->ring_target[origin][rail][slot] = (uint8_t)target;
+  c->ring_previous[origin][rail][slot] = (uint8_t)previous;
+  c->ring_inflight[origin][rail][slot] = serial;
   int next = ring_next(c, target);
   int h = c->rail_hca[next][rail];
-  if (c->hca[h].outstanding[next] >= ROCE_SEND_DEPTH / 4) return 0;
+  if (c->hca[h].outstanding[next] >= ROCE_SEND_DEPTH / 4) return 1;
   if (next != target) {
-    if (ring_submit(c, origin, rail, slot, next, box->data, c->ring_mr[h]->lkey, d) != 0)
-      return -1;
+    if (ring_submit(c, origin, rail, slot, next, box->data, c->ring_mr[h]->lkey, d) != 0) return -1;
     *pending = 2;
     return 0;
   }
@@ -811,13 +820,41 @@ static int ring_service_slot(roce_ctx_t* c, int origin, int rail, int slot) {
   return 0;
 }
 
+// Forwards each sender's packets on a rail in serial order. A stripe's readiness
+// flag rides its last chunk, and writes on one queue pair land in posting order,
+// so chunks whose serials straddle the window boundary must be forwarded in the
+// order the sender posted them. A relay sees only the serials whose route passes
+// through it, so the order comes from the serials that have arrived: slots
+// holding an unforwarded packet are forwarded in ascending serial order, and
+// forwarding stops at the first that has no queue capacity.
 static int ring_service(roce_ctx_t* c) {
   if (c->ring == NULL) return 0;
   for (int origin = 0; origin < c->world; origin++) {
     if (origin == c->rank) continue;
     for (int rail = 0; rail < c->n_rail; rail++) {
+      int ready[RING_WINDOW], count = 0;
+      uint64_t serials[RING_WINDOW];
       for (int slot = 0; slot < RING_WINDOW; slot++) {
-        if (ring_service_slot(c, origin, rail, slot) != 0) return -1;
+        if (c->ring_pending[origin][rail][slot]) {
+          if (ring_service_slot(c, origin, rail, slot) < 0) return -1;
+          continue;
+        }
+        uint64_t serial = __atomic_load_n(&ring_inbox(c, origin, rail, slot)->descriptor.serial,
+                                          __ATOMIC_ACQUIRE);
+        if (serial == c->ring_seen[origin][rail][slot]) continue;
+        int at = count++;
+        while (at > 0 && serials[at - 1] > serial) {
+          serials[at] = serials[at - 1];
+          ready[at] = ready[at - 1];
+          at--;
+        }
+        serials[at] = serial;
+        ready[at] = slot;
+      }
+      for (int k = 0; k < count; k++) {
+        int rc = ring_service_slot(c, origin, rail, ready[k]);
+        if (rc < 0) return -1;
+        if (rc > 0) break;
       }
     }
   }
