@@ -144,6 +144,14 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             "max_rows": int(runtime.max_rows),
             "pack_stride": int(runtime._pack_stride),
             "slot_bytes": int(runtime._slot_bytes),
+            "push_shard_nbytes": (
+                int(runtime.max_rows)
+                // int(runtime.world_size)
+                * int(runtime.row_elems)
+                * torch.bfloat16.itemsize
+                if surface in _BF16_SURFACES
+                else 0
+            ),
             "slots": 2,
             "signal_ptr_count": len(runtime._signal_ptrs),
             "staging_ptr_count": tuple(len(slot) for slot in runtime._staging_ptrs),
@@ -225,6 +233,14 @@ def query_from_metadata(
             "max_rows": int(runtime.max_rows),
             "pack_stride": int(runtime._pack_stride),
             "slot_bytes": int(runtime._slot_bytes),
+            "push_shard_nbytes": (
+                int(runtime.max_rows)
+                // int(runtime.world_size)
+                * int(runtime.row_elems)
+                * torch.bfloat16.itemsize
+                if surface in _BF16_SURFACES
+                else 0
+            ),
             "slots": 2,
             "signal_ptr_count": len(runtime._signal_ptrs),
             "staging_ptr_count": tuple(len(slot) for slot in runtime._staging_ptrs),
@@ -281,39 +297,28 @@ def compile_twoshot_surface(query_payload, ordinal: int):
                 )
                 for device_slot, bias in call["device_slot_variants"]
             }
-        from ._twoshot_bf16_cute import (
-            get_twoshot_bf16_allreduce_launcher,
-            get_twoshot_bf16_launcher,
-        )
+        from ._twoshot_bf16_cute import get_twoshot_bf16_launcher
 
-        getter = (
-            get_twoshot_bf16_allreduce_launcher
+        # The BF16 all-reduce runs as a reduce-scatter followed by an all-gather on the
+        # same serialized channel. Both push payload shards into peer staging,
+        # avoiding remote payload loads.
+        operations = (
+            ("reduce_scatter", "all_gather")
             if call["operation"] == "all_reduce"
-            else get_twoshot_bf16_launcher
+            else (str(call["operation"]),)
         )
         return {
-            (bool(device_slot), int(bias)): (
-                getter(
-                    query.world_size,
-                    query.rank,
-                    bool(device_slot),
-                    int(bias),
-                    int(call["threads"]),
-                    int(call["row_elems"]),
-                    int(ordinal),
-                )
-                if call["operation"] == "all_reduce"
-                else getter(
-                    str(call["operation"]),
-                    query.world_size,
-                    query.rank,
-                    bool(device_slot),
-                    int(bias),
-                    int(call["threads"]),
-                    int(call["row_elems"]),
-                    int(ordinal),
-                )
+            (operation, bool(device_slot), int(bias)): get_twoshot_bf16_launcher(
+                operation,
+                query.world_size,
+                query.rank,
+                bool(device_slot),
+                int(bias),
+                int(call["threads"]),
+                int(call["row_elems"]),
+                int(ordinal),
             )
+            for operation in operations
             for device_slot, bias in call["device_slot_variants"]
         }
 
@@ -322,7 +327,7 @@ def compile_twoshot_surface(query_payload, ordinal: int):
 class _TwoShotExecutionState:
     query: PcieQuery
     runtime: object
-    launchers: Mapping[tuple[bool, int], object]
+    launchers: Mapping[tuple[object, ...], object]
 
     def require_runtime(self, runtime) -> None:
         if runtime is not self.runtime:
@@ -334,9 +339,12 @@ class _TwoShotExecutionState:
         ):
             raise ValueError("two-shot runtime ABI differs from preparation")
 
-    def launcher(self, device_slot_selection: bool, slot_bias: int):
+    def launcher(self, device_slot_selection: bool, slot_bias: int, operation=None):
+        key = (bool(device_slot_selection), int(slot_bias) & 1)
+        if self.query.surface in _BF16_SURFACES:
+            key = (operation or self.query.call["operation"], *key)
         try:
-            return self.launchers[(bool(device_slot_selection), int(slot_bias) & 1)]
+            return self.launchers[key]
         except KeyError as exc:
             raise RuntimeError(
                 "two-shot prepared plan misses requested slot launcher"
@@ -438,12 +446,25 @@ def plan(
 
     def memory(config, device):
         required = int(query.setup["slab_nbytes"])
+        shard_bytes = int(query.setup["push_shard_nbytes"])
+        shard = (
+            (
+                PersistentMemory(
+                    (current_plan(), "pcie_twoshot_push_shard"),
+                    shard_bytes,
+                    shard_bytes,
+                ),
+            )
+            if shard_bytes
+            else ()
+        )
         return MemoryRequirements(
             persistent=(
                 PersistentMemory(
                     (current_plan(), "pcie_twoshot_channel"), required, required
                 ),
             )
+            + shard
         )
 
     def materialize(selection, device):

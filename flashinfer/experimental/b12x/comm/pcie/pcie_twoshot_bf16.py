@@ -56,7 +56,6 @@ SUPPORTED_WORLD_SIZES = (4,)
 class _TwoShotBf16Layout:
     signal_bytes: int
     pack_stride: int
-    reduced_offset: int
     slot_bytes: int
     slab_bytes: int
 
@@ -74,15 +73,11 @@ def _make_layout(max_rows: int, row_elems: int, world_size: int) -> _TwoShotBf16
     packs_per_row = row_elems // _PACK_ELEMS
     pack_stride = _align_up(max_rows_per_rank * packs_per_row, 16)
     payload_bytes = world_size * pack_stride * 16
-    # The pull all-reduce keeps one reduced shard (pack_stride packs) per slot
-    # after the full staged payload.
-    reduced_offset = _align_up(payload_bytes, IPC_SLAB_ALIGNMENT)
-    slot_bytes = _align_up(reduced_offset + pack_stride * 16, IPC_SLAB_ALIGNMENT)
+    slot_bytes = _align_up(payload_bytes, IPC_SLAB_ALIGNMENT)
     signal_bytes = _align_up(_SIGNAL_BYTES, IPC_SLAB_ALIGNMENT)
     return _TwoShotBf16Layout(
         signal_bytes=signal_bytes,
         pack_stride=pack_stride,
-        reduced_offset=reduced_offset,
         slot_bytes=slot_bytes,
         slab_bytes=signal_bytes + 2 * slot_bytes,
     )
@@ -100,7 +95,7 @@ def _require_disjoint(
     *,
     source_name: str,
 ) -> None:
-    """Reject aliases that violate the non-coherent pull-kernel contract."""
+    """Reject aliases that could overwrite an in-flight collective source."""
     if output.device != source.device:
         return
     output_start, output_end = _contiguous_storage_interval(output)
@@ -130,7 +125,6 @@ class PCIeTwoShotBF16:
         max_rows: int,
         row_elems: int,
         pack_stride: int,
-        reduced_offset: int,
         slot_bytes: int,
     ) -> "PCIeTwoShotBF16":
         self = object.__new__(cls)
@@ -152,8 +146,13 @@ class PCIeTwoShotBF16:
         self.max_rows = max_rows
         self.row_elems = row_elems
         self._pack_stride = int(pack_stride)
-        self._reduced_offset = int(reduced_offset)
         self._slot_bytes = int(slot_bytes)
+        # The all-reduce's reduce-scatter result; all-reduces on this serial channel reuse it.
+        self._push_shard = torch.empty(
+            (max_rows // world_size, row_elems),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
         self._slot = 0
         self._device_slot_selection = False
         self._device_slot_bias = 0
@@ -258,7 +257,6 @@ class PCIeTwoShotBF16:
                 max_rows=max_rows,
                 row_elems=row_elems,
                 pack_stride=layout.pack_stride,
-                reduced_offset=layout.reduced_offset,
                 slot_bytes=layout.slot_bytes,
             )
         except Exception as exc:
@@ -377,30 +375,22 @@ class PCIeTwoShotBF16:
         if capturing and not self._device_slot_selection:
             self._device_slot_bias = self._slot & 1
             self._device_slot_selection = True
-        if self._device_slot_selection:
-            slot = 0
-        else:
-            slot = self._slot % 2
-            self._slot += 1
-        launcher = state.launcher(self._device_slot_selection, self._device_slot_bias)
         if operation == "all_reduce":
-            launcher(
-                payload.data_ptr(),
-                self._staging_ptrs[slot],
-                self._signal_ptrs,
-                out.data_ptr(),
-                self.rank,
-                self._reduced_offset,
-                self._slot_bytes,
-                rows_per_rank,
-                blocks,
-            )
+            shard = self._push_shard[:rows_per_rank]
+            steps = (("reduce_scatter", payload, shard), ("all_gather", shard, out))
         else:
-            launcher(
-                payload.data_ptr(),
+            steps = ((operation, payload, out),)
+        for name, source, destination in steps:
+            if self._device_slot_selection:
+                slot = 0
+            else:
+                slot = self._slot % 2
+                self._slot += 1
+            state.launcher(self._device_slot_selection, self._device_slot_bias, name)(
+                source.data_ptr(),
                 self._staging_ptrs[slot],
                 self._signal_ptrs,
-                out.data_ptr(),
+                destination.data_ptr(),
                 self.rank,
                 self._pack_stride,
                 self._slot_bytes,

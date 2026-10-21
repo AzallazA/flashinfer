@@ -1,21 +1,17 @@
-"""Correctness for the single-rounding BF16 PCIe two-shot collectives.
+"""Prepared BF16 collectives and all-reduce dispatch on four CUDA devices.
 
-Run with torchrun on 4 GPUs:
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.run \
+        --nproc-per-node=4 tests/experimental/b12x/comm/test_pcie_twoshot_bf16.py
 
-    NCCL_ALGO=Ring python -m torch.distributed.run --nproc-per-node=4 \
-        tests/comm/test_pcie_twoshot_bf16.py
-
-Every all-reduce is checked against the exact fp32 sum of the gathered
-inputs: the kernel accumulates in fp32 in a fixed rank order and rounds once,
-so each output element must lie within one bf16 rounding of the exact sum,
-same-input eager calls must be bitwise identical, and graph replay must consume
-mutated live inputs.
+Add --benchmark to print all-rank graph times, or --benchmark-only to time the
+same dispatch path in another checkout without running its correctness checks.
 """
 
 from __future__ import annotations
 
+import argparse
+import ctypes
 import os
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -24,22 +20,15 @@ import torch.distributed as dist
 
 from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.comm.pcie import PCIeTwoShotBF16
-from b12x.comm.pcie._twoshot_bf16_cute import (
-    get_twoshot_bf16_allreduce_launcher,
-    get_twoshot_bf16_launcher,
-)
+from b12x.comm.pcie import _twoshot_preparation as preparation
+from b12x.comm.pcie._twoshot_bf16_cute import get_twoshot_bf16_launcher
+from b12x.comm.pcie.pcie_allreduce import PCIeAllReduce
 from b12x.comm.pcie.pcie_twoshot_bf16 import _make_layout
-
-ROW_ELEMS = int(os.getenv("B12X_TEST_TWOSHOT_BF16_ROW_ELEMS", "4096"))
-MAX_ROWS = int(os.getenv("B12X_TEST_TWOSHOT_BF16_MAX_ROWS", "512"))
-ROWS = (8, 16, 32, 64, 96, 128, 192, 256)
+from b12x.preparation import CollectiveRequirement, PreparationSession
 
 
 @pytest.mark.parametrize("shape", ((128, 1024), (32, 4096), (16, 8192), (131072,)))
-def test_prepared_all_reduce_counts_native_rows(monkeypatch, shape) -> None:
-    """Prepared all-reduce accepts the same contiguous layouts as the public API."""
-    import b12x.comm.pcie.pcie_twoshot_bf16 as twoshot_bf16
-
+def test_prepared_all_reduce_counts_native_rows(monkeypatch, shape):
     payload = torch.empty(shape, dtype=torch.bfloat16)
     out = torch.empty_like(payload)
     launches = []
@@ -50,8 +39,8 @@ def test_prepared_all_reduce_counts_native_rows(monkeypatch, shape) -> None:
         row_elems=4096,
         device=torch.device("cpu"),
         _pack_stride=layout.pack_stride,
-        _reduced_offset=layout.reduced_offset,
         _slot_bytes=layout.slot_bytes,
+        _push_shard=torch.empty((8, 4096), dtype=torch.bfloat16),
         _capture_context_depth=0,
         _device_slot_selection=False,
         _device_slot_bias=0,
@@ -63,454 +52,382 @@ def test_prepared_all_reduce_counts_native_rows(monkeypatch, shape) -> None:
         query=SimpleNamespace(
             call={"operation": "all_reduce", "threads": 512, "block_limit": 64}
         ),
-        launcher=lambda *_: lambda *args: launches.append(args),
+        launcher=lambda *key: lambda *args: launches.append((key, args)),
     )
-    monkeypatch.setattr(twoshot_bf16, "_is_current_stream_capturing", lambda _: False)
+    import b12x.comm.pcie.pcie_twoshot_bf16 as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_is_current_stream_capturing", lambda _: False)
     PCIeTwoShotBF16._launch_prepared(
         runtime, payload, None, out, state=state, threads=512, block_limit=64
     )
-    assert len(launches) == 1
-    assert launches[0][0] == payload.data_ptr()
-    assert launches[0][3] == out.data_ptr()
-    assert launches[0][-2] == 8  # 32 native rows split across four ranks.
+    assert len(launches) == 2
+    assert [entry[0][-1] for entry in launches] == ["reduce_scatter", "all_gather"]
+    assert launches[0][1][0] == payload.data_ptr()
+    assert launches[0][1][3] == runtime._push_shard.data_ptr()
+    assert launches[1][1][0] == runtime._push_shard.data_ptr()
+    assert launches[1][1][3] == out.data_ptr()
+    assert launches[0][1][1] == runtime._staging_ptrs[0]
+    assert launches[1][1][1] == runtime._staging_ptrs[1]
+    assert all(entry[1][-2] == 8 for entry in launches)
 
 
-def test_layout_is_tp4_only_and_scales_with_capacity() -> None:
-    for world_size in (2, 8):
+def test_layout_has_only_payload_slots():
+    for world in (2, 8):
         with pytest.raises(ValueError, match="supports only world size 4"):
-            _make_layout(64, ROW_ELEMS, world_size)
-
-    base = _make_layout(64, ROW_ELEMS, 4)
-    assert base.pack_stride > 0 and base.slot_bytes > 0
-    assert base.reduced_offset > 0 and base.slab_bytes >= 2 * base.slot_bytes
-    taller = _make_layout(128, ROW_ELEMS, 4)
-    assert taller.slab_bytes > base.slab_bytes
-    wider = _make_layout(64, 2 * ROW_ELEMS, 4)
-    assert wider.slab_bytes > base.slab_bytes
+            _make_layout(64, 4096, world)
+    layout = _make_layout(131072, 8, 4)
+    assert layout.slot_bytes == 2 << 20
+    assert layout.slab_bytes == layout.signal_bytes + 2 * layout.slot_bytes
+    assert _make_layout(128, 4096, 4).slab_bytes > _make_layout(64, 4096, 4).slab_bytes
 
 
-@pytest.mark.parametrize("world_size", (2, 8))
-def test_private_launchers_reject_unsupported_world_sizes(world_size: int) -> None:
+@pytest.mark.parametrize("world", (2, 8))
+def test_private_launchers_reject_unsupported_world_sizes(world):
     with pytest.raises(ValueError, match="require world size 4"):
-        get_twoshot_bf16_launcher(
-            "reduce_scatter",
-            world_size,
-            0,
-            False,
-            0,
-            512,
-            ROW_ELEMS,
-            0,
-        )
-    with pytest.raises(ValueError, match="require world size 4"):
-        get_twoshot_bf16_allreduce_launcher(
-            world_size,
-            0,
-            False,
-            0,
-            512,
-            ROW_ELEMS,
-            0,
-        )
+        get_twoshot_bf16_launcher("reduce_scatter", world, 0, False, 0, 512, 8, 0)
 
 
-def test_graph_capture_requires_caller_owned_outputs(monkeypatch) -> None:
-    import b12x.comm.pcie.pcie_twoshot_bf16 as twoshot_bf16
-
-    runtime = object.__new__(PCIeTwoShotBF16)
-    runtime.rank = 0
-    runtime.world_size = 4
-    runtime.device = torch.device("cpu")
-    runtime.max_rows = 4
-    runtime.row_elems = 8
-    runtime._closed = False
-    monkeypatch.setattr(twoshot_bf16, "_device_guard", lambda _device: nullcontext())
-    monkeypatch.setattr(
-        twoshot_bf16,
-        "_is_current_stream_capturing",
-        lambda _device: True,
+def test_preparation_accounts_for_persistent_shard():
+    layout = _make_layout(131072, 8, 4)
+    runtime = SimpleNamespace(
+        rank=0,
+        world_size=4,
+        row_elems=8,
+        max_rows=131072,
+        device=torch.device("cpu"),
+        _pack_stride=layout.pack_stride,
+        _slot_bytes=layout.slot_bytes,
+        _signal_ptrs=(100,) * 8,
+        _staging_ptrs=(
+            (100 + layout.signal_bytes,) * 8,
+            (100 + layout.signal_bytes + layout.slot_bytes,) * 8,
+        ),
     )
+    inp = torch.empty(32768, dtype=torch.bfloat16)
+    query = preparation.query_from_runtime(
+        runtime, surface="PCIeTwoShotBF16.all_reduce", call={"inp": inp}
+    )
+    metadata = preparation.query_from_metadata(
+        runtime,
+        surface="PCIeTwoShotBF16.all_reduce",
+        shape=tuple(inp.shape),
+        dtype=inp.dtype,
+    )
+    assert query.setup == metadata.setup
+    assert query.setup["push_shard_nbytes"] == (2 << 20) // 4
+    plan = preparation.plan(query, runtime=runtime)
+    from b12x.preparation.types import _plan_scope
 
-    payload = torch.empty((4, 8), dtype=torch.bfloat16)
-    shard = torch.empty((1, 8), dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError, match="caller-owned preallocated output"):
-        runtime.reduce_scatter(payload)
-    with pytest.raises(RuntimeError, match="caller-owned preallocated output"):
-        runtime.all_gather(shard)
-    with pytest.raises(RuntimeError, match="caller-owned preallocated output"):
-        runtime.all_reduce(payload)
-
-
-def _payload(seed: int, rows: int, device: torch.device) -> torch.Tensor:
-    gen = torch.Generator(device="cpu").manual_seed(seed)
-    x = torch.randn(rows, ROW_ELEMS, generator=gen, dtype=torch.float32) * 3.0
-    return x.to(device=device, dtype=torch.bfloat16)
-
-
-def _exact_sum(x: torch.Tensor, world: int) -> torch.Tensor:
-    gathered = [torch.empty_like(x) for _ in range(world)]
-    dist.all_gather(gathered, x)
-    return sum(g.float() for g in gathered)
-
-
-def _assert_one_rounding(out: torch.Tensor, exact: torch.Tensor) -> None:
-    err = (out.float() - exact).abs()
-    bound = exact.abs() * 2.0**-8 + 1e-5
-    worst = (err - bound).max().item()
-    assert bool((err <= bound).all()), (
-        f"output exceeds one bf16 rounding by {worst:.3e}"
+    with _plan_scope(plan):
+        memory = plan._memory_requirements(None, None)
+    assert sorted(entry.required_nbytes for entry in memory.persistent) == [
+        1 << 19,
+        layout.slab_bytes,
+    ]
+    assert all(
+        entry.required_nbytes == entry.resident_nbytes for entry in memory.persistent
     )
 
 
-def _check_all_reduce(
-    pool: PCIeTwoShotBF16, rank: int, world: int, rows: int, step: int
-) -> None:
-    x = _payload(1000 * step + 7 * rows + rank, rows, pool.device)
-    assert pool.accepts(x)
-    exact = _exact_sum(x, world)
-    out = pool.all_reduce(x)
+def _prepare(session, runtime, operation, payload, out):
+    call = {"inp" if operation == "all_reduce" else "payload": payload, "out": out}
+    if isinstance(runtime, PCIeAllReduce):
+        plan = runtime.plan(payload, out=out)
+    else:
+        query = preparation.query_from_runtime(
+            runtime, surface=f"PCIeTwoShotBF16.{operation}", call=call
+        )
+        plan = preparation.plan(query, runtime=runtime)
+    name = f"{operation}-{payload.numel()}"
+    if plan.query.surface.startswith("PCIeTwoShotBF16."):
+        prime = lambda state: preparation.prepared_call(state, payload=payload, out=out)
+    else:
+        from b12x.comm.pcie._oneshot_preparation import _prepare_plain_call
+
+        prime = lambda state: _prepare_plain_call(state, inp=payload, out=out)
+    session.prepare(
+        (
+            plan.request(
+                name=name,
+                collective=CollectiveRequirement(key=name, ranks=tuple(range(4))),
+                prepare_call=prime,
+            ),
+        ),
+        coordinator=lambda progress: (
+            progress.ready_collectives[0].key if progress.ready_collectives else None
+        ),
+    )
+    return plan
+
+
+def _fill(tensor, rank, step):
+    generator = torch.Generator(device=tensor.device).manual_seed(10007 * step + rank)
+    tensor.copy_(
+        torch.randn(tensor.shape, generator=generator, device=tensor.device) * 3
+    )
+
+
+def _reference(inp):
+    values = [torch.empty_like(inp) for _ in range(4)]
+    dist.all_gather(values, inp)
+    shard = inp.numel() // 4
+    result = torch.empty_like(inp).view(-1)
+    for owner in range(4):
+        interval = slice(owner * shard, (owner + 1) * shard)
+        acc = torch.zeros(shard, dtype=torch.float32, device=inp.device)
+        for offset in range(4):
+            acc.add_(values[(owner + offset) % 4].view(-1)[interval].float())
+        result[interval] = acc.to(torch.bfloat16)
+    return result.view_as(inp)
+
+
+def _allocation_state(device):
+    return (
+        torch.cuda.memory_allocated(device),
+        torch.cuda.memory_stats(device).get("allocation.all.allocated"),
+    )
+
+
+def _epoch(runtime):
+    from b12x.comm.pcie._twoshot_cute import _GRAPH_EPOCH_OFFSET
+
+    value = ctypes.c_uint32()
+    runtime._ipc.cudaMemcpyAsync(
+        ctypes.addressof(value),
+        runtime._signal_ptrs[runtime.rank] + _GRAPH_EPOCH_OFFSET,
+        4,
+        int(torch.cuda.current_stream().cuda_stream),
+    )
     torch.cuda.synchronize()
-    assert out.shape == x.shape and out.dtype == torch.bfloat16
-    _assert_one_rounding(out, exact)
-    again = pool.all_reduce(x)
-    torch.cuda.synchronize()
-    assert torch.equal(out, again), "two-shot all-reduce must be deterministic"
-    # The bf16 NCCL ring rounds after every hop; the two-shot rounds once.
-    ref = x.clone()
-    dist.all_reduce(ref)
-    assert (out.float() - exact).abs().max() <= (ref.float() - exact).abs().max() + 1e-5
+    return value.value
 
 
-def _check_graph_capture(pool: PCIeTwoShotBF16, rank: int, world: int) -> None:
-    rows = min(64, MAX_ROWS)
-    rows -= rows % world
-    assert rows > 0
-    local_rows = rows // world
-    all_reduce_input = _payload(4242 + rank, rows, pool.device)
-    reduce_scatter_input = _payload(4342 + rank, rows, pool.device)
-    all_reduce_out = torch.empty_like(all_reduce_input)
-    reduce_scatter_out = torch.empty(
-        local_rows,
-        ROW_ELEMS,
-        dtype=torch.bfloat16,
-        device=pool.device,
-    )
-    all_gather_out = torch.empty_like(reduce_scatter_input)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with pool.capture(operations=("reduce_scatter", "all_gather")):
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                pool.all_reduce(all_reduce_input, out=all_reduce_out)
-                pool.reduce_scatter(
-                    reduce_scatter_input,
-                    out=reduce_scatter_out,
-                )
-                pool.all_gather(reduce_scatter_out, out=all_gather_out)
-        torch.cuda.current_stream().wait_stream(stream)
-        torch.cuda.synchronize()
-        dist.barrier()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            assert (
-                pool.all_reduce(all_reduce_input, out=all_reduce_out) is all_reduce_out
-            )
-            assert (
-                pool.reduce_scatter(
-                    reduce_scatter_input,
-                    out=reduce_scatter_out,
-                )
-                is reduce_scatter_out
-            )
-            assert (
-                pool.all_gather(reduce_scatter_out, out=all_gather_out)
-                is all_gather_out
-            )
-    torch.cuda.synchronize()
-    dist.barrier()
-    output_addresses = (
-        all_reduce_out.data_ptr(),
-        reduce_scatter_out.data_ptr(),
-        all_gather_out.data_ptr(),
-    )
-    allocator_reports_request_count = torch.cuda.get_allocator_backend() == "native"
-    for replay_step in range(3):
-        all_reduce_input.copy_(
-            _payload(4442 + 100 * replay_step + rank, rows, pool.device)
-        )
-        reduce_scatter_input.copy_(
-            _payload(4542 + 100 * replay_step + rank, rows, pool.device)
-        )
-        exact_all_reduce = _exact_sum(all_reduce_input, world)
-        exact_reduce_scatter = _exact_sum(reduce_scatter_input, world)
-        all_reduce_out.fill_(float("nan"))
-        reduce_scatter_out.fill_(float("nan"))
-        all_gather_out.fill_(float("nan"))
-        torch.cuda.synchronize()
-        dist.barrier()
-        allocated_before_replay = torch.cuda.memory_allocated(pool.device)
-        allocation_count_before_replay = (
-            int(torch.cuda.memory_stats(pool.device)["allocation.all.allocated"])
-            if allocator_reports_request_count
-            else None
-        )
-        graph.replay()
-        torch.cuda.synchronize()
-        if allocation_count_before_replay is not None:
-            assert (
-                int(torch.cuda.memory_stats(pool.device)["allocation.all.allocated"])
-                == allocation_count_before_replay
-            )
-        assert torch.cuda.memory_allocated(pool.device) == allocated_before_replay
-        dist.barrier()
-        assert (
-            all_reduce_out.data_ptr(),
-            reduce_scatter_out.data_ptr(),
-            all_gather_out.data_ptr(),
-        ) == output_addresses
-        _assert_one_rounding(all_reduce_out, exact_all_reduce)
-        expected_shard = exact_reduce_scatter[
-            rank * local_rows : (rank + 1) * local_rows
-        ]
-        _assert_one_rounding(reduce_scatter_out, expected_shard)
-        reference_shards = [torch.empty_like(reduce_scatter_out) for _ in range(world)]
-        dist.all_gather(reference_shards, reduce_scatter_out)
-        assert torch.equal(all_gather_out, torch.cat(reference_shards, dim=0))
-        for source_rank in range(world):
-            source_rows = slice(
-                source_rank * local_rows,
-                (source_rank + 1) * local_rows,
-            )
-            _assert_one_rounding(
-                all_gather_out[source_rows],
-                exact_reduce_scatter[source_rows],
-            )
-
-
-def _check_live_rows_reuse_prepared_launchers(
-    pool: PCIeTwoShotBF16,
-    rank: int,
-    world: int,
-) -> None:
-    live_rows = tuple(
-        rows
-        for rows in (world, 2 * world, min(64, MAX_ROWS), MAX_ROWS)
-        if rows > 0 and rows <= MAX_ROWS and rows % world == 0
+def _check_dispatch(session, manager, rank, *, benchmark=False, benchmark_only=False):
+    sizes = (
+        65536 - 64,
+        65536,
+        65536 + 64,
+        (640 << 10) - 64,
+        640 << 10,
+        (640 << 10) + 64,
+        (2 << 20) - 64,
+        2 << 20,
+        (2 << 20) + 64,
     )
     cases = []
-    for index, rows in enumerate(dict.fromkeys(live_rows)):
-        payload = _payload(7000 + 100 * index + rank, rows, pool.device)
-        local_rows = rows // world
-        cases.append(
-            (
-                payload,
-                _exact_sum(payload, world),
-                torch.empty_like(payload),
-                torch.empty(
-                    local_rows,
-                    ROW_ELEMS,
-                    dtype=torch.bfloat16,
-                    device=pool.device,
-                ),
-                torch.empty_like(payload),
-            )
+    for size in sizes:
+        inp = torch.empty((size // 64, 32), dtype=torch.bfloat16, device=manager.device)
+        _fill(inp, rank, size)
+        out = torch.empty_like(inp)
+        plan = _prepare(session, manager, "all_reduce", inp, out)
+        push = plan.query.surface == "PCIeTwoShotBF16.all_reduce"
+        if not benchmark_only:
+            assert push == (65536 <= size <= 2 << 20), (size, plan.query.surface)
+        with session.capture():
+            manager.all_reduce(inp, plan=plan, out=out)
+        torch.cuda.synchronize()
+        if not benchmark_only:
+            assert torch.equal(out, _reference(inp)), ("eager", size)
+        graph = torch.cuda.CUDAGraph()
+        dist.barrier()
+        with session.capture(), manager.capture(), torch.cuda.graph(graph):
+            manager.all_reduce(inp, plan=plan, out=out)
+        cases.append((size, inp, out, plan, graph))
+    if not benchmark_only:
+        fused_input = torch.empty(
+            (1, 32768), device=manager.device, dtype=torch.bfloat16
         )
+        fused_plan = manager.plan(
+            fused_input, operation="all_reduce_fused_add_rms_norm"
+        )
+        assert (
+            fused_plan.query.surface == "OneshotAllReduce.all_reduce_fused_add_rms_norm"
+        )
+        over_capacity = torch.empty(
+            ((2 << 20) + 128) // 2, device=manager.device, dtype=torch.bfloat16
+        )
+        with pytest.raises(ValueError, match="requirements"):
+            manager.plan(over_capacity)
+        # Alternating sizes and live inputs share one persistent shard and epoch.
+        for step in range(5):
+            for size, inp, out, plan, graph in cases[:: 1 if step % 2 else -1]:
+                _fill(inp, rank, 100 + step + size)
+                expected = _reference(inp)
+                out.fill_(float("nan"))
+                torch.cuda.synchronize()
+                dist.barrier()
+                before = _allocation_state(manager.device)
+                with (
+                    session.capture(),
+                    kernel_resolution_guard("prepared all-reduce replay"),
+                ):
+                    graph.replay()
+                torch.cuda.synchronize()
+                assert _allocation_state(manager.device) == before
+                assert torch.equal(out, expected), ("graph", size, step)
+    if benchmark:
+        for size, inp, out, plan, graph in cases:
+            durations = []
+            for sample in range(5):
+                for _ in range(8):
+                    graph.replay()
+                torch.cuda.synchronize()
+                dist.barrier()
+                start, end = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                start.record()
+                for _ in range(100):
+                    graph.replay()
+                end.record()
+                end.synchronize()
+                local = torch.tensor(
+                    [start.elapsed_time(end) * 1000 / 100], device=manager.device
+                )
+                dist.all_reduce(local, op=dist.ReduceOp.MAX)
+                durations.append(round(local.item(), 3))
+            if rank == 0:
+                print(
+                    f"allreduce bytes={size} surface={plan.query.surface} graph_us_max_rank={durations}",
+                    flush=True,
+                )
+    for _, _, _, _, graph in cases:
+        graph.reset()
 
-    warm_payload, _, warm_all_reduce, warm_shard, warm_gather = cases[-1]
-    pool.all_reduce(warm_payload, out=warm_all_reduce)
-    pool.reduce_scatter(warm_payload, out=warm_shard)
-    pool.all_gather(warm_shard, out=warm_gather)
-    torch.cuda.synchronize()
-    dist.barrier()
 
-    with kernel_resolution_guard(
-        "PCIeTwoShotBF16 live rows must reuse warmed launcher geometry"
-    ):
-        for payload, exact, all_reduce_out, shard, gathered in cases:
-            local_rows = payload.shape[0] // world
-            pool.all_reduce(payload, out=all_reduce_out)
-            pool.reduce_scatter(payload, out=shard)
-            pool.all_gather(shard, out=gathered)
+def _check_mixed(session, pool, rank):
+    # Native 8-element rows match the dispatcher's geometry, including odd slots.
+    cases = []
+    for rows in (4, 4096, 4092, pool.max_rows):
+        inp = torch.empty(
+            (rows, pool.row_elems), dtype=torch.bfloat16, device=pool.device
+        )
+        _fill(inp, rank, rows)
+        out, shard, gathered = (
+            torch.empty_like(inp),
+            torch.empty_like(inp[: rows // 4]),
+            torch.empty_like(inp),
+        )
+        ar = _prepare(session, pool, "all_reduce", inp, out)
+        rs = _prepare(session, pool, "reduce_scatter", inp, shard)
+        ag = _prepare(session, pool, "all_gather", shard, gathered)
+        with session.capture():
+            pool.reduce_scatter(inp, plan=rs, out=shard)  # Offset the initial slot.
+            pool.all_reduce(inp, plan=ar, out=out)
+            pool.all_gather(shard, plan=ag, out=gathered)
+        torch.cuda.synchronize()
+        expected = _reference(inp)
+        assert torch.equal(out, expected) and torch.equal(gathered, expected)
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), pool.capture(plan=ar), torch.cuda.graph(graph):
+            pool.all_reduce(inp, plan=ar, out=out)
+            pool.reduce_scatter(inp, plan=rs, out=shard)
+            pool.all_gather(shard, plan=ag, out=gathered)
+            pool.reduce_scatter(
+                inp, plan=rs, out=shard
+            )  # Five protocol epochs per replay.
+        cases.append((inp, out, shard, gathered, ar, graph))
+    epoch = _epoch(pool)
+    shard_address = pool._push_shard.data_ptr()
+    owners = tuple((b.local_ptr, tuple(b.remote_ptrs)) for b in pool._owned_buffers)
+    for step in range(8):
+        for inp, out, shard, gathered, ar, graph in cases[:: 1 if step % 2 else -1]:
+            _fill(inp, rank, step + 1000 + inp.numel())
+            expected = _reference(inp)
+            for destination in (out, shard, gathered):
+                destination.fill_(float("nan"))
             torch.cuda.synchronize()
             dist.barrier()
-            _assert_one_rounding(all_reduce_out, exact)
-            expected_shard = exact[rank * local_rows : (rank + 1) * local_rows]
-            _assert_one_rounding(shard, expected_shard)
-            reference_shards = [torch.empty_like(shard) for _ in range(world)]
-            dist.all_gather(reference_shards, shard)
-            assert torch.equal(gathered, torch.cat(reference_shards, dim=0))
-
-
-def _check_rejects_divergent_graph_slot_bias(pool: PCIeTwoShotBF16, rank: int) -> None:
-    if rank == 0:
-        pool._slot += 1
-    try:
-        with (
-            pytest.raises(
-                RuntimeError,
-                match="graph slot selection contract differs across ranks",
-            ),
-            pool.capture(),
-        ):
-            pass
-    finally:
-        if rank == 0:
-            pool._slot -= 1
-    dist.barrier()
-
-
-def _check_reduce_scatter_all_gather(
-    pool: PCIeTwoShotBF16, rank: int, world: int
-) -> None:
-    rows = MAX_ROWS
-    assert rows > 0 and rows % world == 0
-    local_rows = rows // world
-    payload = _payload(5300 + rank, rows, pool.device)
-    exact = _exact_sum(payload, world)
-
-    shard = torch.empty(
-        local_rows,
-        ROW_ELEMS,
-        dtype=torch.bfloat16,
-        device=pool.device,
-    )
-    returned_shard = pool.reduce_scatter(payload, out=shard)
-    torch.cuda.synchronize()
-    assert returned_shard is shard
-    expected_shard = exact[rank * local_rows : (rank + 1) * local_rows]
-    _assert_one_rounding(shard, expected_shard)
-
-    gathered = torch.empty_like(payload)
-    returned_gather = pool.all_gather(shard, out=gathered)
-    torch.cuda.synchronize()
-    assert returned_gather is gathered
-    reference_shards = [torch.empty_like(shard) for _ in range(world)]
-    dist.all_gather(reference_shards, shard)
-    assert torch.equal(gathered, torch.cat(reference_shards, dim=0))
-
-
-def _check_rejects_unsupported(pool: PCIeTwoShotBF16, world: int) -> None:
-    device = pool.device
+            before = _allocation_state(pool.device)
+            with (
+                session.capture(),
+                kernel_resolution_guard("mixed BF16 collective replay"),
+            ):
+                graph.replay()
+            torch.cuda.synchronize()
+            assert _allocation_state(pool.device) == before
+            epoch += 5
+            assert _epoch(pool) == epoch
+            assert pool._push_shard.data_ptr() == shard_address
+            assert (
+                tuple((b.local_ptr, tuple(b.remote_ptrs)) for b in pool._owned_buffers)
+                == owners
+            )
+            assert torch.equal(out, expected) and torch.equal(gathered, expected)
+            local = expected.view(4, -1)[rank].view_as(shard)
+            assert torch.equal(shard, local)
+    for *_, graph in cases:
+        graph.reset()
+    inp, out, shard, gathered, ar, _ = cases[0]
+    rs = _prepare(session, pool, "reduce_scatter", inp, shard)
+    ag = _prepare(session, pool, "all_gather", shard, gathered)
+    for operation, payload, plan, invalid, error, message in (
+        (pool.all_reduce, inp, ar, out.view(-1), ValueError, "output shape"),
+        (pool.all_reduce, inp, ar, inp, ValueError, "must not overlap input"),
+        (pool.reduce_scatter, inp, rs, inp[:1], ValueError, "must not overlap payload"),
+        (pool.all_gather, inp[:1], ag, inp, ValueError, "must not overlap payload"),
+        (
+            pool.reduce_scatter,
+            inp,
+            rs,
+            shard.to(torch.float16),
+            TypeError,
+            "must be bfloat16",
+        ),
+    ):
+        with pytest.raises(error, match=message):
+            operation(payload, plan=plan, out=invalid)
     assert not pool.accepts(
-        torch.empty(MAX_ROWS + world, ROW_ELEMS, dtype=torch.bfloat16, device=device)
-    )
-    assert not pool.accepts(
-        torch.empty(world, ROW_ELEMS, dtype=torch.float16, device=device)
-    )
-    assert not pool.accepts(
-        torch.empty(world, ROW_ELEMS + 8, dtype=torch.bfloat16, device=device)
-    )
-    if world > 1:
-        assert not pool.accepts(
-            torch.empty(world + 1, ROW_ELEMS, dtype=torch.bfloat16, device=device)
+        torch.empty(
+            pool.max_rows * pool.row_elems + 32,
+            device=pool.device,
+            dtype=torch.bfloat16,
         )
-    storage = torch.empty(
-        world * ROW_ELEMS + 1,
-        dtype=torch.bfloat16,
-        device=device,
     )
-    misaligned = storage[1:].view(world, ROW_ELEMS)
-    assert misaligned.is_contiguous()
-    assert misaligned.data_ptr() % 16 != 0
-    assert not pool.accepts(misaligned)
+    assert not pool.accepts(torch.empty(32, device=pool.device, dtype=torch.float16))
+    storage = torch.empty(33, device=pool.device, dtype=torch.bfloat16)
+    assert not pool.accepts(storage[1:])
 
 
-def _check_rejects_invalid_outputs(pool: PCIeTwoShotBF16, world: int) -> None:
-    x = _payload(6100 + pool.rank, world, pool.device)
-    wrong_shape = torch.empty(
-        x.numel(),
-        dtype=torch.bfloat16,
-        device=pool.device,
-    )
-    with pytest.raises(ValueError, match="output shape"):
-        pool.all_reduce(x, out=wrong_shape)
-
-    storage = torch.empty(
-        x.numel() + 1,
-        dtype=torch.bfloat16,
-        device=pool.device,
-    )
-    misaligned = storage[1:].view_as(x)
-    with pytest.raises(ValueError, match="16-byte aligned"):
-        pool.all_reduce(x, out=misaligned)
-
-    local_rows = x.shape[0] // world
-    with pytest.raises(TypeError, match="output must be bfloat16"):
-        pool.reduce_scatter(
-            x,
-            out=torch.empty(
-                local_rows,
-                ROW_ELEMS,
-                dtype=torch.float16,
-                device=pool.device,
-            ),
-        )
-
-    shard = _payload(6200 + pool.rank, local_rows, pool.device)
-    with pytest.raises(ValueError, match="output shape"):
-        pool.all_gather(shard, out=x[:local_rows])
-
-    overlap_storage = torch.empty(
-        x.numel() + 8,
-        dtype=torch.bfloat16,
-        device=pool.device,
-    )
-    overlap_input = overlap_storage[: x.numel()].view_as(x)
-    overlap_output = overlap_storage[8:].view_as(x)
-    with pytest.raises(ValueError, match="output must not overlap input"):
-        pool.all_reduce(overlap_input, out=overlap_output)
-
-    with pytest.raises(ValueError, match="output must not overlap payload"):
-        pool.reduce_scatter(x, out=x[:local_rows])
-
-    gather_storage = torch.empty_like(x)
-    gather_payload = gather_storage[:local_rows]
-    with pytest.raises(ValueError, match="output must not overlap payload"):
-        pool.all_gather(gather_payload, out=gather_storage)
-
-
-def main() -> None:
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--benchmark-only", action="store_true")
+    args = parser.parse_args()
     rank = int(os.environ["RANK"])
-    world = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    # The error comparison below is specifically against NCCL's BF16 ring.
-    os.environ["NCCL_ALGO"] = "Ring"
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
-    device = torch.device("cuda", local_rank)
-
-    pool = PCIeTwoShotBF16.from_exchange_group(
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    dist.init_process_group("nccl", device_id=device)
+    assert dist.get_world_size() == 4
+    manager = PCIeAllReduce.from_exchange_group(
         exchange_group=dist.group.WORLD,
         device=device,
-        max_rows=MAX_ROWS,
-        row_elems=ROW_ELEMS,
+        max_size=(2 << 20) + 64,
+        single_channel=True,
     )
-    pool.prepare_graph()
-    _check_rejects_unsupported(pool, world)
-    _check_rejects_invalid_outputs(pool, world)
-    _check_reduce_scatter_all_gather(pool, rank, world)
-    executed_rows = []
-    for step in range(3):  # exercises the double-buffered staging slots
-        for rows in ROWS:
-            if rows % world == 0 and rows <= MAX_ROWS:
-                _check_all_reduce(pool, rank, world, rows, step)
-                if rows not in executed_rows:
-                    executed_rows.append(rows)
-    _check_all_reduce(pool, rank, world, MAX_ROWS, step=3)
-    if MAX_ROWS not in executed_rows:
-        executed_rows.append(MAX_ROWS)
-    _check_rejects_divergent_graph_slot_bias(pool, rank)
-    _check_live_rows_reuse_prepared_launchers(pool, rank, world)
-    _check_graph_capture(pool, rank, world)
-    dist.barrier()
-    if rank == 0:
-        print(
-            "pcie_twoshot_bf16 correctness OK "
-            f"({world} ranks, all_reduce_rows={tuple(executed_rows)}, "
-            f"workspace_max_rows={MAX_ROWS})"
+    manager.prepare_channels(("test:bf16",))
+    session = PreparationSession(device=device, autotune=False, compile_workers=1)
+    try:
+        _check_dispatch(
+            session,
+            manager,
+            rank,
+            benchmark=args.benchmark or args.benchmark_only,
+            benchmark_only=args.benchmark_only,
         )
-    pool.close()
-    dist.destroy_process_group()
+        if not args.benchmark_only:
+            _check_mixed(session, manager._bf16_twoshot, rank)
+            if rank == 0:
+                print(
+                    "TP4 BF16 prepared dispatch and mixed eager/graph correctness OK",
+                    flush=True,
+                )
+    finally:
+        torch.cuda.synchronize()
+        session.close()
+        manager.close()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
