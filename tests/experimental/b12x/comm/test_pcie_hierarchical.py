@@ -53,6 +53,50 @@ def _prepared_dispatch(manager, inp, **call):
     return plan
 
 
+@pytest.mark.parametrize("rank_sms", [(188, 188, 188, 188), (188, 63, 188, 188)])
+def test_serialized_tp4_bf16_factory_requires_a_resident_grid_on_every_rank(
+    monkeypatch, rank_sms
+):
+    group, ipc = object(), object()
+    runtime = SimpleNamespace(rank=0, world_size=4, device=torch.device("cuda:0"))
+    oneshot_factory = MagicMock(return_value=runtime)
+    twoshot_factory = MagicMock(return_value=object())
+    monkeypatch.setattr(pcie_allreduce.dist, "get_world_size", lambda group: 4)
+    monkeypatch.setattr(
+        pcie_allreduce.PCIeOneshotAllReducePool, "from_exchange_group", oneshot_factory
+    )
+    monkeypatch.setattr(
+        pcie_allreduce.PCIeTwoShotBF16, "from_exchange_group", twoshot_factory
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=rank_sms[0]),
+    )
+
+    def gather(values, local, *, group):
+        assert local == rank_sms[0]
+        values[:] = rank_sms
+
+    monkeypatch.setattr(pcie_allreduce.dist, "all_gather_object", gather)
+    manager = PCIeAllReduce.from_exchange_group(
+        exchange_group=group,
+        device="cuda:0",
+        max_size=8 << 20,
+        single_channel=True,
+        ipc=ipc,
+    )
+    assert manager._runtime is runtime
+    if min(rank_sms) >= 64:
+        twoshot_factory.assert_called_once_with(
+            exchange_group=group, device="cuda:0", max_rows=40960, row_elems=8, ipc=ipc
+        )
+        assert manager._bf16_twoshot is twoshot_factory.return_value
+    else:
+        twoshot_factory.assert_not_called()
+        assert manager._bf16_twoshot is None
+
+
 @pytest.mark.parametrize("strided", [False, True])
 def test_hierarchical_query_preserves_tensor_metadata(strided: bool) -> None:
     from b12x.comm.pcie import _owner_preparation

@@ -173,6 +173,7 @@ class PCIeTwoShotBF16:
         device: torch.device | int | str,
         max_rows: int,
         row_elems: int,
+        ipc=None,
     ) -> "PCIeTwoShotBF16":
         rank = dist.get_rank(group=exchange_group)
         world_size = dist.get_world_size(group=exchange_group)
@@ -208,7 +209,7 @@ class PCIeTwoShotBF16:
         )
 
         def prepare():
-            prepared_ipc = CudaRTLibrary()
+            prepared_ipc = ipc if ipc is not None else CudaRTLibrary()
             prepared_ipc.cudaSetDevice(_cuda_device_index(device_obj))
             return prepared_ipc, _make_layout(max_rows, row_elems, world_size)
 

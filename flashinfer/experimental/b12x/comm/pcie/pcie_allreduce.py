@@ -42,6 +42,8 @@ from .pcie_oneshot import (
     PCIeOneshotAllReducePool,
     _tp2_plain_remote_push_enabled,
 )
+from .pcie_twoshot_bf16 import PCIeTwoShotBF16
+from .pcie_twoshot import TWOSHOT_REQUIRED_SMS
 
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,9 @@ ISLAND_RS_MAX_BYTES = 160 * 1024
 # Partial islands use the leader path without the equal-quarter alternative.
 # Limit default dispatch to decode vectors of at most 32 KiB.
 PARTIAL_ISLAND_MAX_BYTES = 32 * 1024
+# Serialized TP4 BF16 messages above this size favor single-rounding two-shot.
+BF16_TWOSHOT_MIN_BYTES = 64 * 1024
+BF16_TWOSHOT_MAX_BYTES = 640 * 1024
 
 
 def _algorithm_override() -> str:
@@ -109,7 +114,9 @@ def _algorithm_for_world_size(world_size: int) -> str:
 class PCIeAllReduce:
     """Select a peer-safe all-reduce implementation from the world size.
 
-    Worlds through TP8 use the low-latency all-peer oneshot runtime. TP9,
+    Worlds through TP8 use the low-latency all-peer oneshot runtime. Serialized
+    TP4 BF16 messages in the 64–640 KiB band use single-rounding two-shot
+    when every rank has at least 64 visible SMs. TP9,
     TP10, TP12 and TP16 use islands of up to four GPUs so no context maps more than
     six peers. Other worlds fail closed instead of exceeding the CUDA peer
     connection limit.
@@ -122,11 +129,14 @@ class PCIeAllReduce:
         island_rs: Any = None,
         *,
         algorithm_override: Optional[str] = None,
+        bf16_twoshot: Any = None,
     ) -> None:
         self._runtime = runtime
         # Optional second implementation for the same world. When present the
         # dispatcher routes by message size instead of exposing a knob.
         self._island_rs = island_rs
+        self._bf16_twoshot = bf16_twoshot
+        self._bf16_twoshot_plan = None
         resolved_override = (
             _algorithm_override()
             if algorithm_override is None
@@ -193,11 +203,35 @@ class PCIeAllReduce:
             algorithm_override=algorithm_override,
             ipc=ipc,
         )
+        bf16_twoshot = None
+        if world_size == 4 and single_channel and max_size >= BF16_TWOSHOT_MIN_BYTES:
+            visible_sms = [None] * world_size
+            dist.all_gather_object(
+                visible_sms,
+                int(
+                    torch.cuda.get_device_properties(
+                        runtime.device
+                    ).multi_processor_count
+                ),
+                group=exchange_group,
+            )
+            if min(visible_sms) >= TWOSHOT_REQUIRED_SMS:
+                # Native rows contain one 16-byte pack; tensor dimensions need
+                # not match the transport geometry. Each rank owns complete packs.
+                capacity = min(int(max_size), BF16_TWOSHOT_MAX_BYTES)
+                bf16_twoshot = PCIeTwoShotBF16.from_exchange_group(
+                    exchange_group=exchange_group,
+                    device=device,
+                    max_rows=(capacity + 63) // 64 * 4,
+                    row_elems=8,
+                    ipc=ipc,
+                )
         return cls(
             runtime,
             algorithm,
             island_rs,
             algorithm_override=algorithm_override,
+            bf16_twoshot=bf16_twoshot,
         )
 
     @staticmethod
@@ -347,6 +381,27 @@ class PCIeAllReduce:
 
         if operation not in ("all_reduce", "all_reduce_fused_add_rms_norm"):
             raise ValueError(f"unsupported all-reduce operation {operation!r}")
+        if (
+            operation == "all_reduce"
+            and self._bf16_twoshot is not None
+            and BF16_TWOSHOT_MIN_BYTES
+            <= inp.numel() * inp.element_size()
+            <= min(self.max_size, BF16_TWOSHOT_MAX_BYTES)
+            and self._bf16_twoshot.accepts(inp)
+        ):
+            query = query_from_runtime(
+                self._bf16_twoshot,
+                surface="PCIeTwoShotBF16.all_reduce",
+                call={"inp": inp, **call},
+            )
+            result = plan(
+                query,
+                runtime=self._bf16_twoshot,
+                invocation=invocation,
+                override=override,
+            )
+            self._bf16_twoshot_plan = result
+            return result
         if self.algorithm == "oneshot":
             target = self._runtime._prepared_channel_for_stream(stream, channel_id)
             surface = f"OneshotAllReduce.{operation}"
@@ -370,6 +425,15 @@ class PCIeAllReduce:
         channel_id: Optional[str] = None,
     ) -> torch.Tensor:
         state = require_prepared(plan, "comm.pcie", inp.device)
+        if self._bf16_twoshot is not None and state.runtime is self._bf16_twoshot:
+            if peer_input_ptrs is not None or blocks is not None:
+                raise ValueError(
+                    "two-shot all-reduce uses its prepared staging and launch geometry"
+                )
+            if stream is not None:
+                with torch.cuda.stream(stream):
+                    return self._bf16_twoshot.all_reduce(inp, plan=plan, out=out)
+            return self._bf16_twoshot.all_reduce(inp, plan=plan, out=out)
         if self.algorithm == "hierarchical":
             if peer_input_ptrs is not None:
                 raise ValueError(
@@ -445,11 +509,19 @@ class PCIeAllReduce:
                 stack.enter_context(
                     self._island_rs.capture(stream=stream, channel_id=channel_id)
                 )
+            if self._bf16_twoshot_plan is not None:
+                stack.enter_context(
+                    self._bf16_twoshot.capture(plan=self._bf16_twoshot_plan)
+                )
             # Callers must retain message-size dispatch while recording a
             # graph; yielding the hierarchy would bypass the island runtime.
             yield self
 
     def close(self) -> None:
+        if self._bf16_twoshot is not None:
+            self._bf16_twoshot.close()
+            self._bf16_twoshot = None
+            self._bf16_twoshot_plan = None
         if self._island_rs is not None:
             self._island_rs.close()
             self._island_rs = None
