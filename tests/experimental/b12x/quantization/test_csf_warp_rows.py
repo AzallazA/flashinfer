@@ -79,7 +79,7 @@ class ReadWords:
 
 
 @pytest.mark.parametrize("pointer_dtype", [cutlass.Uint8, cutlass.Uint32])
-@pytest.mark.parametrize("quantization", ["mxfp4"])
+@pytest.mark.parametrize("quantization", ["mxfp4", "nvfp4"])
 @pytest.mark.parametrize(
     "rows,columns,sections", [(128, 4, 1), (1152, 160, 2), (5120, 18, 1), (192, 6, 1)]
 )
@@ -123,7 +123,8 @@ def test_warp_scale_words_exact(
                     ]
                     block += 1
     expected = expected_bytes.reshape(-1).view(torch.int32)
-    outputs = [torch.empty(size, dtype=torch.int32, device=device) for _ in range(2)]
+    modes = (False, True) if quantization == "mxfp4" else (False,)
+    outputs = [torch.empty(size, dtype=torch.int32, device=device) for _ in modes]
     source_before = payload.storage.clone()
     pointer = make_ptr(pointer_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     programs = [
@@ -136,7 +137,7 @@ def test_warp_scale_words_exact(
                 "test.csf_warp_rows", 1, (plane.geometry, registers, str(pointer_dtype))
             ),
         )
-        for registers in (False, True)
+        for registers in modes
     ]
     source = make_ptr(
         pointer_dtype,
@@ -169,9 +170,10 @@ def test_warp_scale_words_exact(
 
 
 @pytest.mark.parametrize("pointer_dtype", [cutlass.Uint8, cutlass.Uint32])
+@pytest.mark.parametrize("quantization", ["mxfp4", "nvfp4"])
 @pytest.mark.parametrize("record_count", [6, 7, 8, 31, 32, 33, 212, 256])
 def test_global_record_tail_pointer_stride_boundary(
-    pointer_dtype, record_count, monkeypatch
+    pointer_dtype, quantization, record_count, monkeypatch
 ):
     """The last replacement crosses staging capacity through either pointer view."""
     import numpy as np
@@ -180,7 +182,8 @@ def test_global_record_tail_pointer_stride_boundary(
 
     rows, columns = 128, 4
     bases = np.full(rows, 120, dtype=np.uint8)
-    codes = np.zeros(rows * ((columns + 7) // 8), dtype=np.uint8)
+    fields = 2 if quantization == "nvfp4" else 8
+    codes = np.zeros(rows * ((columns + fields - 1) // fields), dtype=np.uint8)
     fixed = np.concatenate(
         (bases.reshape(-1, 16), codes.reshape(rows // 16, -1)), axis=1
     )
@@ -192,7 +195,7 @@ def test_global_record_tail_pointer_stride_boundary(
     assert len(positions) == len(set(positions)) == record_count
     records = np.array(positions, dtype=np.uint32) | (np.uint32(128) << np.uint32(24))
     plane = export_csf_blocks(
-        fixed, records, rows=rows, columns=columns, quantization="mxfp4"
+        fixed, records, rows=rows, columns=columns, quantization=quantization
     )
     assert plane.exceptions.size == record_count
     logical = np.full((2, rows, columns), 120, dtype=np.uint8)
@@ -210,4 +213,4 @@ def test_global_record_tail_pointer_stride_boundary(
         "planes_and_native",
         lambda *args, **kwargs: ((plane, plane), native),
     )
-    test_warp_scale_words_exact(pointer_dtype, "mxfp4", rows, columns, 1, "sparse")
+    test_warp_scale_words_exact(pointer_dtype, quantization, rows, columns, 1, "sparse")
