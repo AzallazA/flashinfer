@@ -139,12 +139,15 @@ def _prepare(session, runtime, operation, payload, out):
         )
         plan = preparation.plan(query, runtime=runtime)
     name = f"{operation}-{payload.numel()}"
+    prime_out = torch.empty_like(payload) if out is None else out
     if plan.query.surface.startswith("PCIeTwoShotBF16."):
-        prime = lambda state: preparation.prepared_call(state, payload=payload, out=out)
+        prime = lambda state: preparation.prepared_call(
+            state, payload=payload, out=prime_out
+        )
     else:
         from b12x.comm.pcie._oneshot_preparation import _prepare_plain_call
 
-        prime = lambda state: _prepare_plain_call(state, inp=payload, out=out)
+        prime = lambda state: _prepare_plain_call(state, inp=payload, out=prime_out)
     session.prepare(
         (
             plan.request(
@@ -296,6 +299,90 @@ def _check_dispatch(session, manager, rank, *, benchmark=False, benchmark_only=F
         graph.reset()
 
 
+def _check_dispatch_contracts(session, manager, rank):
+    inp = torch.empty(32768, device=manager.device, dtype=torch.bfloat16)
+    out = torch.empty_like(inp)
+    _fill(inp, rank, 71)
+    prepared = _prepare(session, manager, "all_reduce", inp, out)
+    unused = manager.plan(inp, out=out)
+    assert prepared is not unused and unused._prepared is None
+    graph = torch.cuda.CUDAGraph()
+    with session.capture(), manager.capture(), torch.cuda.graph(graph):
+        manager.all_reduce(inp, plan=prepared, out=out)
+    with session.capture():
+        with pytest.raises(RuntimeError, match="not prepared|capture|frozen"):
+            manager.all_reduce(inp, plan=unused, out=out)
+    foreign = object.__new__(PCIeTwoShotBF16)
+    foreign.device = manager.device
+    with session.capture(), pytest.raises(ValueError, match="runtime|another"):
+        foreign.all_reduce(inp, plan=prepared, out=out)
+    expected = _reference(inp)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected)
+    graph.reset()
+
+    omitted = _prepare(session, manager, "all_reduce", inp, None)
+    assert omitted.query.surface == "PCIeTwoShotBF16.all_reduce"
+    with session.capture():
+        actual = manager.all_reduce(inp, plan=omitted)
+    torch.cuda.synchronize()
+    assert torch.equal(actual, expected)
+
+    stream = torch.cuda.Stream(device=manager.device)
+    with torch.cuda.stream(stream):
+        streamed = manager.plan(inp, out=out, stream=stream)
+    assert streamed.query.surface == "PCIeTwoShotBF16.all_reduce"
+    # Use the prepared compatible ABI with the explicit stream launch surface.
+    stream.wait_stream(torch.cuda.current_stream())
+    with session.capture():
+        manager.all_reduce(inp, plan=prepared, out=out, stream=stream)
+    stream.synchronize()
+    assert torch.equal(out, expected)
+
+    alias = _prepare(session, manager, "all_reduce", inp, inp)
+    assert alias.query.surface == "OneshotAllReduce.all_reduce"
+    _fill(inp, rank, 72)
+    expected = _reference(inp)
+    with session.capture():
+        manager.all_reduce(inp, plan=alias, out=inp)
+    torch.cuda.synchronize()
+    assert torch.equal(inp, expected)
+    graph = torch.cuda.CUDAGraph()
+    with session.capture(), manager.capture(), torch.cuda.graph(graph):
+        manager.all_reduce(inp, plan=alias, out=inp)
+    _fill(inp, rank, 73)
+    expected = _reference(inp)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(inp, expected)
+    graph.reset()
+
+
+def _check_capability_failure(device, rank):
+    from b12x.comm.pcie.pcie_allreduce import _bf16_twoshot_supported
+
+    original = torch.cuda.get_device_properties
+
+    def properties(queried_device):
+        if rank == 1:
+            torch.cuda.get_device_properties = original
+            raise RuntimeError("injected rank-1 capability query failure")
+        return original(queried_device)
+
+    torch.cuda.get_device_properties = properties
+    try:
+        with pytest.raises(
+            RuntimeError, match="injected rank-1 capability query failure"
+        ):
+            _bf16_twoshot_supported(
+                exchange_group=dist.group.WORLD, device=device, world_size=4
+            )
+    finally:
+        torch.cuda.get_device_properties = original
+    dist.barrier()
+
+
 def _check_mixed(session, pool, rank):
     # Native 8-element rows match the dispatcher's geometry, including odd slots.
     cases = []
@@ -400,6 +487,7 @@ def main():
     torch.cuda.set_device(device)
     dist.init_process_group("nccl", device_id=device)
     assert dist.get_world_size() == 4
+    _check_capability_failure(device, rank)
     manager = PCIeAllReduce.from_exchange_group(
         exchange_group=dist.group.WORLD,
         device=device,
@@ -417,6 +505,7 @@ def main():
             benchmark_only=args.benchmark_only,
         )
         if not args.benchmark_only:
+            _check_dispatch_contracts(session, manager, rank)
             _check_mixed(session, manager._bf16_twoshot, rank)
             if rank == 0:
                 print(

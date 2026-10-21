@@ -41,6 +41,8 @@ from .pcie_oneshot import (
     TP2_PLAIN_REMOTE_PUSH_AUTO_MAX_BYTES,
     PCIeOneshotAllReducePool,
     _tp2_plain_remote_push_enabled,
+    _broadcast_gather_object,
+    _run_collective_preallocation_setup,
 )
 from .pcie_twoshot_bf16 import PCIeTwoShotBF16
 from .pcie_twoshot import TWOSHOT_REQUIRED_SMS
@@ -60,6 +62,23 @@ BF16_TWOSHOT_MIN_BYTES = 64 * 1024
 # The push two-shot stays below one-shot through verification-sized batches;
 # the cap bounds the channel's staging (two slots plus the reduce-scatter shard).
 BF16_TWOSHOT_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _bf16_twoshot_supported(*, exchange_group, device, world_size) -> bool:
+    """Coordinate capability-query failures before exchanging SM counts."""
+    visible_sms = _run_collective_preallocation_setup(
+        owner="PCIe twoshot-bf16 capability query",
+        exchange_group=exchange_group,
+        setup=lambda: int(
+            torch.cuda.get_device_properties(device).multi_processor_count
+        ),
+    )
+    counts = _broadcast_gather_object(visible_sms, exchange_group)
+    if len(counts) != world_size or any(
+        type(count) is not int or count <= 0 for count in counts
+    ):
+        raise RuntimeError("invalid peer PCIe twoshot-bf16 SM count")
+    return all(count >= TWOSHOT_REQUIRED_SMS for count in counts)
 
 
 def _algorithm_override() -> str:
@@ -118,7 +137,8 @@ class PCIeAllReduce:
 
     Worlds through TP8 use the low-latency all-peer oneshot runtime. Serialized
     TP4 BF16 messages in the 64 KiB–2 MiB band use single-rounding two-shot
-    when every rank has at least 64 visible SMs. TP9,
+    when every rank has at least 64 visible SMs and supplied output storage
+    is disjoint from the input. TP9,
     TP10, TP12 and TP16 use islands of up to four GPUs so no context maps more than
     six peers. Other worlds fail closed instead of exceeding the CUDA peer
     connection limit.
@@ -138,7 +158,6 @@ class PCIeAllReduce:
         # dispatcher routes by message size instead of exposing a knob.
         self._island_rs = island_rs
         self._bf16_twoshot = bf16_twoshot
-        self._bf16_twoshot_plan = None
         resolved_override = (
             _algorithm_override()
             if algorithm_override is None
@@ -198,26 +217,26 @@ class PCIeAllReduce:
                 ext_module=ext_module,
                 ipc=ipc,
             )
-        island_rs = cls._maybe_island_rs(
-            exchange_group=exchange_group,
-            device=device,
-            max_size=max_size,
-            algorithm_override=algorithm_override,
-            ipc=ipc,
-        )
+        island_rs = None
         bf16_twoshot = None
-        if world_size == 4 and single_channel and max_size >= BF16_TWOSHOT_MIN_BYTES:
-            visible_sms = [None] * world_size
-            dist.all_gather_object(
-                visible_sms,
-                int(
-                    torch.cuda.get_device_properties(
-                        runtime.device
-                    ).multi_processor_count
-                ),
-                group=exchange_group,
+        try:
+            island_rs = cls._maybe_island_rs(
+                exchange_group=exchange_group,
+                device=device,
+                max_size=max_size,
+                algorithm_override=algorithm_override,
+                ipc=ipc,
             )
-            if min(visible_sms) >= TWOSHOT_REQUIRED_SMS:
+            if (
+                world_size == 4
+                and single_channel
+                and max_size >= BF16_TWOSHOT_MIN_BYTES
+                and _bf16_twoshot_supported(
+                    exchange_group=exchange_group,
+                    device=runtime.device,
+                    world_size=world_size,
+                )
+            ):
                 # Native rows contain one 16-byte pack; tensor dimensions need
                 # not match the transport geometry. Each rank owns complete packs.
                 capacity = min(int(max_size), BF16_TWOSHOT_MAX_BYTES)
@@ -228,6 +247,13 @@ class PCIeAllReduce:
                     row_elems=8,
                     ipc=ipc,
                 )
+        except BaseException:
+            try:
+                if island_rs is not None:
+                    island_rs.close()
+            finally:
+                runtime.close()
+            raise
         return cls(
             runtime,
             algorithm,
@@ -363,6 +389,27 @@ class PCIeAllReduce:
             return True
         return self._use_island_rs(inp)
 
+    def _use_bf16_twoshot(self, inp: torch.Tensor, out: Optional[torch.Tensor]) -> bool:
+        target = self._bf16_twoshot
+        if (
+            target is None
+            or not BF16_TWOSHOT_MIN_BYTES
+            <= inp.numel() * inp.element_size()
+            <= min(self.max_size, BF16_TWOSHOT_MAX_BYTES)
+            or not target.accepts(inp)
+        ):
+            return False
+        if out is None:
+            return True
+        if not target.accepts(out) or inp.shape != out.shape:
+            return False
+        source_begin, output_begin = inp.data_ptr(), out.data_ptr()
+        nbytes = inp.numel() * inp.element_size()
+        return (
+            source_begin + nbytes <= output_begin
+            or output_begin + nbytes <= source_begin
+        )
+
     def plan(
         self,
         inp: torch.Tensor,
@@ -383,27 +430,18 @@ class PCIeAllReduce:
 
         if operation not in ("all_reduce", "all_reduce_fused_add_rms_norm"):
             raise ValueError(f"unsupported all-reduce operation {operation!r}")
-        if (
-            operation == "all_reduce"
-            and self._bf16_twoshot is not None
-            and BF16_TWOSHOT_MIN_BYTES
-            <= inp.numel() * inp.element_size()
-            <= min(self.max_size, BF16_TWOSHOT_MAX_BYTES)
-            and self._bf16_twoshot.accepts(inp)
-        ):
+        if operation == "all_reduce" and self._use_bf16_twoshot(inp, call.get("out")):
             query = query_from_runtime(
                 self._bf16_twoshot,
                 surface="PCIeTwoShotBF16.all_reduce",
                 call={"inp": inp, **call},
             )
-            result = plan(
+            return plan(
                 query,
                 runtime=self._bf16_twoshot,
                 invocation=invocation,
                 override=override,
             )
-            self._bf16_twoshot_plan = result
-            return result
         if self.algorithm == "oneshot":
             target = self._runtime._prepared_channel_for_stream(stream, channel_id)
             surface = f"OneshotAllReduce.{operation}"
@@ -511,10 +549,8 @@ class PCIeAllReduce:
                 stack.enter_context(
                     self._island_rs.capture(stream=stream, channel_id=channel_id)
                 )
-            if self._bf16_twoshot_plan is not None:
-                stack.enter_context(
-                    self._bf16_twoshot.capture(plan=self._bf16_twoshot_plan)
-                )
+            if self._bf16_twoshot is not None:
+                stack.enter_context(self._bf16_twoshot.capture())
             # Callers must retain message-size dispatch while recording a
             # graph; yielding the hierarchy would bypass the island runtime.
             yield self
@@ -523,7 +559,6 @@ class PCIeAllReduce:
         if self._bf16_twoshot is not None:
             self._bf16_twoshot.close()
             self._bf16_twoshot = None
-            self._bf16_twoshot_plan = None
         if self._island_rs is not None:
             self._island_rs.close()
             self._island_rs = None

@@ -334,9 +334,10 @@ class PCIeTwoShotBF16:
     # ---- graph plumbing ---------------------------------------------------
 
     @contextmanager
-    def capture(self, *, plan: Plan):
-        state = require_prepared(plan, "comm.pcie", self.device)
-        state.require_runtime(self)
+    def capture(self, *, plan: Plan | None = None):
+        if plan is not None:
+            state = require_prepared(plan, "comm.pcie", self.device)
+            state.require_runtime(self)
         if self._capture_context_depth:
             raise RuntimeError(
                 "overlapping PCIe twoshot-bf16 capture contexts are not allowed"
@@ -369,9 +370,7 @@ class PCIeTwoShotBF16:
         blocks = max(1, min(int(block_limit), (shard_packs + threads - 1) // threads))
         capturing = _is_current_stream_capturing(self.device)
         if capturing and self._capture_context_depth <= 0:
-            raise RuntimeError(
-                "PCIe twoshot-bf16 capture requires runtime.capture(plan=...)"
-            )
+            raise RuntimeError("PCIe twoshot-bf16 capture requires runtime.capture()")
         if capturing and not self._device_slot_selection:
             self._device_slot_bias = self._slot & 1
             self._device_slot_selection = True
