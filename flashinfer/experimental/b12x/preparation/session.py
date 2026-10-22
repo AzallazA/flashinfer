@@ -12,6 +12,7 @@ import logging
 import gc
 import math
 import os
+import pickle
 import threading
 import time
 from contextlib import contextmanager, nullcontext
@@ -807,6 +808,8 @@ class PreparationJob:
         self._all_programs = set()
         self._dependency_programs = {}
         self._coverage = {}
+        self._described_candidates = {}
+        self._described_jobs = {}
         self._benchmark_calls = {}
         self._plans_by_name = {}
         self._started = time.monotonic()
@@ -817,6 +820,8 @@ class PreparationJob:
         self._active_request = None
         self._total_requests = len(requests)
         self._completed_requests = 0
+        self._planned_requests = 0
+        self._candidates_described = 0
         self._selection_counts = {}
         self._candidate_count = self._candidates_prepared = 0
         self._global_candidate_count = 0
@@ -856,7 +861,7 @@ class PreparationJob:
             else "waiting for ranks"
             if ready_collectives or ready_tuning or ready_cache
             else "compiling"
-            if pending_compilation
+            if pending_compilation and self._phase != "planning programs"
             else self._phase
         )
         request = self._active_request
@@ -891,6 +896,8 @@ class PreparationJob:
             global_candidate_count=self._global_candidate_count,
             selection_counts=tuple(sorted(self._selection_counts.items())),
             ready_cache=ready_cache,
+            planned_requests=self._planned_requests,
+            candidates_described=self._candidates_described,
         )
 
     def _collective_barrier(self, requirement: CollectiveRequirement) -> None:
@@ -1239,7 +1246,7 @@ class PreparationJob:
         self._direct_ready = True
 
     def _configure(self, groups):
-        obligations, settled, enumerations, requirements = [], {}, {}, []
+        obligations, enumerations, requirements = [], {}, []
         for requests in groups:
             request = next(
                 (
@@ -1340,6 +1347,8 @@ class PreparationJob:
                                 break
                             if candidate is not None:
                                 obligation.candidates.append(candidate)
+                            if iterator.cartesian_count % 256 == 0:
+                                yield "metadata"
                         complete = iterator.done
                         coverage = {
                             "cartesian_count": iterator.cartesian_count,
@@ -1361,10 +1370,6 @@ class PreparationJob:
                         raise ValueError(
                             f"no eligible configurations for {plan.component_id}"
                         )
-                    if complete and len(obligation.candidates) > 1:
-                        yield from self._describe_candidates(obligation)
-                        if not self._warmup_only:
-                            self._lookup(obligation, settled)
                     if complete and len(obligation.candidates) == 1:
                         assignment, config = obligation.candidates[0]
                         obligation.selection = self._selection(
@@ -1374,17 +1379,9 @@ class PreparationJob:
                         obligation.selection = self._selection(
                             obligation, configuration.default, "default"
                         )
-                    elif (
-                        self.session.cache_only
-                        and obligation.selection is None
-                        and self._choice_key(obligation, settled) is not None
-                    ):
-                        raise LookupError(f"no completed selection for {request.name}")
                     if obligation.selection is None:
                         obligation.coverage = dict(coverage)
             for item in requests:
-                if obligation.selection is not None:
-                    settled[item.name] = (obligation.selection, item.plan.contract)
                 if (
                     item.plan.prepared is not None
                     and item.plan.selection == obligation.selection
@@ -1402,6 +1399,7 @@ class PreparationJob:
                     requirements.append(
                         item.plan._memory_requirements(config, self.session.device)
                     )
+            self._planned_requests += 1
             yield "metadata"
         MemoryRequirements.sequential(requirements)
         rank_index = self.session._tuning_ranks.index(self.session._tuning_rank)
@@ -1415,7 +1413,55 @@ class PreparationJob:
         return obligations
 
     def _describe_candidates(self, obligation):
-        contract = obligation.request.plan.contract
+        plan = obligation.request.plan
+        contract = plan.contract
+        declaration = _declaration_key(plan)
+        self._candidates_described = 0
+        self._phase = "planning programs"
+        cached = self._described_candidates.get(declaration)
+        if cached is not None:
+            (
+                obligation.candidate_program_identity,
+                obligation.compiled,
+                obligation.programs,
+            ) = cached
+            self._candidates_described = len(obligation.candidates)
+            return
+        if self.session.compile_workers and self.session.device.ordinal is not None:
+            batch_size = 32 * self.session.compile_workers
+            for start in range(0, len(obligation.candidates), batch_size):
+                if self._warmup_only:
+                    return
+                jobs, configs = [], []
+                for _, config in obligation.candidates[start : start + batch_size]:
+                    payload = contract.config_payload(config)
+                    candidate_jobs = tuple(
+                        plan._compile_jobs(config, self.session.device)
+                    )
+                    configs.append((payload, len(candidate_jobs)))
+                    jobs.extend(candidate_jobs)
+                if jobs:
+                    pool = self.session._compiler()
+                    keys = pool.describe(jobs)
+                    while True:
+                        if self._warmup_only:
+                            return
+                        descriptions = pool.descriptions(keys)
+                        if descriptions is not None:
+                            break
+                        yield "compile"
+                else:
+                    descriptions = ()
+                offset = 0
+                for payload, count in configs:
+                    compiled = descriptions[offset : offset + count]
+                    offset += count
+                    obligation.compiled[payload] = compiled
+                    obligation.programs[payload] = frozenset(
+                        p for item in compiled for p in item.programs
+                    )
+                    self._candidates_described += 1
+                yield "metadata"
         identities = []
         for assignment, config in obligation.candidates:
             programs = yield from self._describe_programs(obligation, config)
@@ -1428,7 +1474,15 @@ class PreparationJob:
                     "programs": sorted((p.dialect, p.key) for p in programs),
                 }
             )
+            self._candidates_described = max(
+                self._candidates_described, len(identities)
+            )
         obligation.candidate_program_identity = digest(identities)
+        self._described_candidates[declaration] = (
+            obligation.candidate_program_identity,
+            obligation.compiled,
+            obligation.programs,
+        )
 
     def _describe_programs(self, obligation, config):
         contract, plan = obligation.request.plan.contract, obligation.request.plan
@@ -1438,9 +1492,13 @@ class PreparationJob:
             for job in plan._compile_jobs(config, self.session.device):
                 if self._warmup_only:
                     return frozenset()
-                with self.session._gpu_scope():
-                    with self._timing.span("compile_plan"):
-                        description = describe_compilation(job)
+                key = pickle.dumps(job, protocol=5)
+                description = self._described_jobs.get(key)
+                if description is None:
+                    with self.session._gpu_scope():
+                        with self._timing.span("compile_plan"):
+                            description = describe_compilation(job)
+                    self._described_jobs[key] = description
                 compiled.append(description)
                 yield "metadata"
             obligation.compiled[payload] = tuple(compiled)
@@ -2191,6 +2249,8 @@ class PreparationJob:
                         obligation, configuration.default, source
                     )
                 if obligation.selection is None:
+                    yield from self._describe_candidates(obligation)
+                    self._phase = "selecting"
                     self._lookup(obligation, selections)
                 if obligation.selection is not None and obligation.planned_candidates:
                     self._total_candidates -= obligation.planned_candidates

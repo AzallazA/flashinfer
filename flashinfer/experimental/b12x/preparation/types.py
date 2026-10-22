@@ -353,6 +353,8 @@ class PreparationProgress:
     global_candidate_count: int = 0
     selection_counts: tuple[tuple[str, int], ...] = ()
     ready_cache: TuningCacheRequirement | None = None
+    planned_requests: int = 0
+    candidates_described: int = 0
 
 
 @dataclass(kw_only=True)

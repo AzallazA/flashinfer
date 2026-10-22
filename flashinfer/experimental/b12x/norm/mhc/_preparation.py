@@ -222,50 +222,90 @@ def compile_mhc(query_payload, config_payload, native_payload, ordinal):
     )
 
 
+@dataclass(frozen=True)
+class _MhcCompileOperands:
+    mode: object
+    tensors: dict
+    # Fake operand metadata owns no executable programs.
+    __b12x_programs__ = ()
+
+
+@program_cache(scope="preparation")
+def _fake_operands(query_payload, ordinal):
+    """Reuse shape-faithful operands across a query's compile configurations."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    query = _decode_query(query_payload)
+    device = torch.device("cuda", ordinal)
+    m, h, s = query.max_tokens, query.hidden_size, query.split_k
+    mode = FakeTensorMode()
+    with mode:
+
+        def empty(shape, dtype=torch.bfloat16):
+            return torch.empty(shape, dtype=dtype, device=device)
+
+        values = dict(
+            x=empty((m, h)),
+            residual=empty((m, 4, h)),
+            out=empty((m, 4, h)),
+            mix=empty((m, 4), torch.float32),
+        )
+        if query.operation != "collapse":
+            values.update(
+                prev_post=empty((m, 4), torch.float32),
+                prev_comb=empty((m, 4, 4), torch.float32),
+                partials=empty((m, s, 25), torch.float32),
+                fn=empty(
+                    (
+                        24,
+                        h
+                        if query.operation == "pre" and not query.expanded_residual
+                        else 4 * h,
+                    ),
+                    torch.float32,
+                ),
+                fn_bf16=empty((24, 4 * h)),
+                norm=empty((h,), getattr(torch, query.norm_weight_dtype))
+                if query.has_norm_weight
+                else None,
+                scale=empty((3,), torch.float32),
+                bias=empty((24,), torch.float32),
+                y=empty((m, h)),
+            )
+    return _MhcCompileOperands(mode, values)
+
+
 @program_cache(scope="preparation")
 def _compile_mhc(query_payload, config_payload, native_payload, ordinal):
     """Compile exactly the chosen branch using shape-faithful CUDA FakeTensors."""
-    from torch._subclasses.fake_tensor import FakeTensorMode
     from . import _kernels as kernels
 
     query = _decode_query(query_payload)
     config = MhcConfig.from_config(FrozenMapping(config_payload))
     native = _NativeLaunch(**native_payload)
-    device = torch.device("cuda", ordinal)
-    m, h, s = query.max_tokens, query.hidden_size, query.split_k
+    fake = _fake_operands(query_payload, ordinal)
+    operands = fake.tensors
     programs = {}
-    with FakeTensorMode(), compile_only_launches():
-
-        def empty(shape, dtype=torch.bfloat16):
-            return torch.empty(shape, dtype=dtype, device=device)
-
-        x, residual, out = empty((m, h)), empty((m, 4, h)), empty((m, 4, h))
+    with fake.mode, compile_only_launches():
+        x, residual, out = (operands[name] for name in ("x", "residual", "out"))
         if query.operation == "collapse":
-            mix = empty((m, 4), torch.float32) if query.collapse_weighted else None
+            mix = operands["mix"] if query.collapse_weighted else None
             programs["collapse"] = kernels._run_mhc_collapse_launch(
                 state=residual, pre_mix=mix, out=x
             )
             return programs
-        prev_post, prev_comb = (
-            empty((m, 4), torch.float32),
-            empty((m, 4, 4), torch.float32),
+        prev_post, prev_comb, partials, fn, norm, scale, bias = (
+            operands[name]
+            for name in (
+                "prev_post",
+                "prev_comb",
+                "partials",
+                "fn",
+                "norm",
+                "scale",
+                "bias",
+            )
         )
-        partials = empty((m, s, 25), torch.float32)
-        fn = empty(
-            (
-                24,
-                h
-                if query.operation == "pre" and not query.expanded_residual
-                else 4 * h,
-            ),
-            torch.float32,
-        )
-        norm = (
-            empty((h,), getattr(torch, query.norm_weight_dtype))
-            if query.has_norm_weight
-            else None
-        )
-        scale, bias = empty((3,), torch.float32), empty((24,), torch.float32)
 
         def post_pre_programs(pre_mix=None, y=None):
             args = dict(
@@ -289,7 +329,7 @@ def _compile_mhc(query_payload, config_payload, native_payload, ordinal):
                 else:
                     programs["project"] = kernels._run_mhc_prefill_bf16_project_launch(
                         out=out,
-                        fn_bf16=empty((24, 4 * h)),
+                        fn_bf16=operands["fn_bf16"],
                         partials=partials,
                         use_tma=native.route == "bf16_tma",
                     )
@@ -329,7 +369,7 @@ def _compile_mhc(query_payload, config_payload, native_payload, ordinal):
             )
             return programs
         if query.lagged_mix:
-            mix, y = empty((m, 4), torch.float32), empty((m, h))
+            mix, y = operands["mix"], operands["y"]
             if native.route == "lagged_tf32":
                 from ._pre_prefill import prepare_lagged_prefill
 

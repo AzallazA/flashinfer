@@ -51,7 +51,9 @@ def test_transient_panel_leaves_only_its_parent_display(failed):
 
     output = io.StringIO()
     console = Console(file=output, force_terminal=True, width=100, height=30)
-    with Live("Prepare and tune kernels", console=console, auto_refresh=False) as parent:
+    with Live(
+        "Prepare and tune kernels", console=console, auto_refresh=False
+    ) as parent:
         with PreparationDisplay(
             global_rank=0, console=console, transient=True
         ) as display:
@@ -476,11 +478,29 @@ def test_progress_bar_measures_candidate_work_independently_of_request_count():
 
 def test_planning_does_not_present_request_fraction_as_remaining_work():
     display, console = _attach(140, 40)
-    display.update(_progress(completed_requests=1, total_requests=100))
+    display.update(
+        _progress(planned_requests=17, completed_requests=1, total_requests=100)
+    )
     text = _render_text(display, console)
     assert "Counting candidates" in text
-    assert "1 / 100 requests ready" in text
+    assert "17 / 100 requests counted" in text
     assert "%" not in text
+
+
+def test_program_discovery_reports_candidates_without_calling_them_compilations():
+    display, console = _attach(140, 40)
+    display.update(
+        _progress(
+            phase="planning programs",
+            candidate_count=11624,
+            candidates_described=64,
+            total_candidates=20000,
+        )
+    )
+    text = _render_text(display, console)
+    assert "Discovering kernel programs" in text
+    assert "64 / 11624 candidates described" in text
+    assert "Counting candidates" not in text
 
 
 @pytest.mark.parametrize("width", [60, 84])

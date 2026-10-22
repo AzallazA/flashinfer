@@ -22,6 +22,7 @@ from .types import PreparationProgress
 _STAGES = ("PLAN", "BUILD", "TUNE", "PRIME", "READY")
 _PHASE_STAGE = {
     "planning": "PLAN",
+    "planning programs": "BUILD",
     "selecting": "PLAN",
     "compiling": "BUILD",
     "preparing candidates": "TUNE",
@@ -35,6 +36,7 @@ _PHASE_STAGE = {
 }
 _PHASE_LABEL = {
     "planning": "Planning requests",
+    "planning programs": "Discovering kernel programs",
     "selecting": "Selecting configuration",
     "compiling": "Compiling kernels",
     "preparing candidates": "Preparing candidates",
@@ -180,7 +182,9 @@ class PreparationDisplay:
             from rich.console import Console
 
             self._attach(
-                self._console if self._console is not None else Console(file=self._stream)
+                self._console
+                if self._console is not None
+                else Console(file=self._stream)
             )
         return self
 
@@ -227,6 +231,8 @@ class PreparationDisplay:
             progress.component_id,
             progress.request_name,
             progress.completed_requests,
+            progress.planned_requests,
+            progress.candidates_described,
             progress.candidate_count,
             progress.candidates_prepared,
             progress.completed_rounds,
@@ -463,6 +469,24 @@ class PreparationDisplay:
         from rich.text import Text
 
         p = frame.progress
+        if p.phase == "planning programs" and not p.done:
+            return self._two(
+                Text("Discovering kernel programs", style=_DIM),
+                Text(
+                    f"{p.candidates_described} / {p.candidate_count} candidates described",
+                    style=_INK,
+                    no_wrap=True,
+                ),
+            )
+        if p.phase == "planning" and p.total_candidates is None and not p.done:
+            return self._two(
+                Text("Counting candidates", style=_DIM),
+                Text(
+                    f"{p.planned_requests} / {p.total_requests} requests counted",
+                    style=_INK,
+                    no_wrap=True,
+                ),
+            )
         if p.total_candidates:
             fraction = p.measured_candidates / p.total_candidates
             label = Text(

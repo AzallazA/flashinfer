@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import pickle
 import time
+from collections import deque
 from contextlib import contextmanager
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
@@ -464,6 +465,32 @@ def _run_job(payload: bytes, expected: tuple[ProgramKey, ...]):
     )
 
 
+def _describe_jobs(payloads: tuple[bytes, ...]):
+    import torch
+    from .compile_plan import evict_planning_artifacts
+    from .program_cache import PreparationProgramCache
+
+    cache = PreparationProgramCache()
+    try:
+        with cache.activate():
+            result = tuple(
+                (payload, describe_compilation(pickle.loads(payload)).programs)
+                for payload in payloads
+            )
+        if torch.cuda.is_initialized():
+            raise RuntimeError(
+                "compiler worker initialized CUDA while planning artifacts"
+            )
+        return result
+    except Exception as error:
+        raise RuntimeError(
+            f"program discovery: {type(error).__name__}: {error}"
+        ) from error
+    finally:
+        cache.clear()
+        evict_planning_artifacts()
+
+
 @dataclass(frozen=True, kw_only=True)
 class CompilationSummary:
     jobs: int
@@ -524,6 +551,8 @@ class CompilePool:
         self._started = time.monotonic()
         self._condition = Condition()
         self._plans: dict[bytes, CompilationPlan] = {}
+        self._planning_jobs: dict[bytes, CompileJob] = {}
+        self._descriptions = deque()
         self._submitted: set[ProgramKey] = set()
         self._cute_programs = self._triton_programs = 0
         self._completed: set[ProgramKey] = set()
@@ -571,14 +600,46 @@ class CompilePool:
             self._inflight -= 1
             self._condition.notify_all()
 
+    def describe(self, jobs: Iterable[CompileJob]) -> tuple[bytes, ...]:
+        """Queue metadata discovery once per factory invocation."""
+        keys = []
+        with self._condition:
+            if self._pool is None:
+                raise RuntimeError("compiler pool is closed")
+            self._raise_errors()
+            for job in jobs:
+                payload = pickle.dumps(job, protocol=5)
+                keys.append(payload)
+                if payload not in self._plans and payload not in self._planning_jobs:
+                    self._planning_jobs[payload] = job
+                    self._descriptions.append(payload)
+            self._dispatch()
+        return tuple(keys)
+
+    def descriptions(
+        self, keys: tuple[bytes, ...]
+    ) -> tuple[CompilationPlan, ...] | None:
+        with self._condition:
+            self._raise_errors()
+            if any(key not in self._plans for key in keys):
+                return None
+            return tuple(self._plans[key] for key in keys)
+
+    def _finish_descriptions(self, result):
+        with self._condition:
+            for payload, programs in result:
+                self._plans[payload] = CompilationPlan(
+                    self._planning_jobs.pop(payload), programs
+                )
+            self._inflight -= 1
+            self._dispatch()
+            self._condition.notify_all()
+
     def plan(self, jobs: Iterable[CompileJob]) -> tuple[CompilationPlan, ...]:
-        result = []
-        for job in jobs:
-            payload = pickle.dumps(job, protocol=5)
-            if payload not in self._plans:
-                self._plans[payload] = describe_compilation(job)
-            result.append(self._plans[payload])
-        return tuple(result)
+        keys = self.describe(jobs)
+        while (result := self.descriptions(keys)) is None:
+            self.wait_for_progress()
+        return result
 
     def _dispatch(self):
         # Called under the Condition. Pool.apply_async's queue is bounded here,
@@ -586,6 +647,19 @@ class CompilePool:
         while (
             self._pool is not None and self._inflight < self._limit and not self._errors
         ):
+            if not self._required and self._descriptions:
+                payloads = tuple(
+                    self._descriptions.popleft()
+                    for _ in range(min(32, len(self._descriptions)))
+                )
+                self._inflight += 1
+                self._pool.apply_async(
+                    _describe_jobs,
+                    (payloads,),
+                    callback=self._finish_descriptions,
+                    error_callback=self._fail,
+                )
+                continue
             queue = self._required if self._required else self._optional
             if not queue:
                 break
@@ -671,7 +745,9 @@ class CompilePool:
     def pending(self):
         with self._condition:
             self._raise_errors()
-            return bool(self._required or self._optional or self._inflight)
+            return bool(
+                self._required or self._optional or self._descriptions or self._inflight
+            )
 
     def wait_for_progress(self, timeout=0.05):
         with self._condition:
