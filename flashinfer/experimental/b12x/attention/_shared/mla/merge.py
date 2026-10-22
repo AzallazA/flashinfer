@@ -186,7 +186,7 @@ def _tensor_meta_key(
     tensor: torch.Tensor,
     *,
     dynamic_dims: tuple[int, ...] = (),
-) -> tuple[tuple[object, ...], tuple[int, ...], str, tuple[str, int | None]]:
+) -> tuple[tuple[object, ...], tuple[int, ...], str, str]:
     dynamic_dim_set = set(dynamic_dims)
     return (
         tuple(
@@ -195,7 +195,7 @@ def _tensor_meta_key(
         ),
         tuple(tensor.stride()),
         str(tensor.dtype),
-        (tensor.device.type, tensor.device.index),
+        tensor.device.type,
     )
 
 

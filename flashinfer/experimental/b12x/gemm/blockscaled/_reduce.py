@@ -50,7 +50,7 @@ def compile_reduce(n: int, slices: int, device: int):
             "A16 split-K reduction must be prewarmed before CUDA graph capture"
         )
     launch = WeightOnlySplitKReduce(n, slices)
-    key = (n, slices, device)
+    key = (n, slices)
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     return b12x_compile(
         launch,

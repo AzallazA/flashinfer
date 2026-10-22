@@ -494,7 +494,8 @@ def compile_score_representatives(
     if device_index is None:
         device_index = torch.cuda.current_device()
     with torch.cuda.device(device_index):
-        key = (device_index, geometry, tuple(t.dtype for t in tensors))
+        compile_key = (geometry, tuple(t.dtype for t in tensors))
+        key = (device_index, compile_key)
         raw = _CACHE.get(key)
         if raw is None:
             kernel = _RepresentativeScoreKernel(*geometry)
@@ -514,7 +515,9 @@ def compile_score_representatives(
                 Int32(1),
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
-                    "attention.qsa.representative_score", 4, key
+                    "attention.qsa.representative_score",
+                    4,
+                    compile_key,
                 ),
             )
             _CACHE[key] = raw

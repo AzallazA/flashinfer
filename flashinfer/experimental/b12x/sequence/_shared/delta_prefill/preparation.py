@@ -243,7 +243,7 @@ def make_plan(caps, impl, tuning, *, invocation, override):
                 component,
                 replace(query, exhaustive=False, autotune_effort="medium").to_dict(),
                 tuning.TUNING.encode_config(config),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

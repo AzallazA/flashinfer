@@ -1433,7 +1433,6 @@ def _compile(
         compile_spec=KernelCompileSpec.from_facts(
             _KERNEL_ID,
             _KERNEL_VERSION,
-            ("device_index", device_index),
             ("a_dtype", "bfloat16"),
             ("b_dtype", "float8_e4m3fn"),
             ("sf_dtype", "float8_e8m0fnu"),
@@ -1532,7 +1531,6 @@ def _compile_mla_query_projection(
         compile_spec=KernelCompileSpec.from_facts(
             _MLA_QUERY_KERNEL_ID,
             _MLA_QUERY_KERNEL_VERSION,
-            ("device_index", device_index),
             ("a_dtype", "bfloat16"),
             ("b_dtype", "float8_e4m3fn"),
             ("sf_dtype", "float8_e8m0fnu"),

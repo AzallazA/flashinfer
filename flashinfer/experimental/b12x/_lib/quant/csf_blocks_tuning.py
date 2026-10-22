@@ -289,7 +289,7 @@ def plan_csf_block_expansion(
                 "b12x._lib.quant.csf_blocks_tuning:compile_expansion",
                 _program_query_payload(query),
                 TUNING.encode_config(config),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

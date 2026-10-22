@@ -305,7 +305,6 @@ def _compiled_direct_w4a8_compact(
             "moe.w4a8.compact_micro",
             4,
             (
-                device_index,
                 max_tokens,
                 num_topk,
                 k,

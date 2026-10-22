@@ -217,7 +217,8 @@ def _launch(
     device_index = source.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    key = (kind, int(device_index), int(streams), int(hidden_size))
+    compile_key = (kind, int(streams), int(hidden_size))
+    key = (int(device_index), compile_key)
     with torch.cuda.device(device_index):
         capturing = torch.cuda.is_current_stream_capturing()
         with _LOCK:
@@ -246,7 +247,7 @@ def _launch(
                         compile_spec=KernelCompileSpec.from_key(
                             "sequence.mtp_feedback.norm",
                             2,
-                            key,
+                            compile_key,
                         ),
                     )
                     _CACHE[key] = compiled

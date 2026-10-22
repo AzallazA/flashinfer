@@ -436,7 +436,7 @@ def plan(
                     replace(query, exhaustive=False, autotune_effort="medium")
                 ),
                 TUNING.encode_config(config),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

@@ -219,7 +219,7 @@ def make_plan(caps, *, invocation, override):
                 "b12x.sequence.mtp_feedback._preparation:compile_feedback",
                 TUNING.encode_query(query),
                 config.to_dict(),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

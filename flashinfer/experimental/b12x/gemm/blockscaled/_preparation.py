@@ -608,7 +608,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
                 config.to_dict(),
                 None if p is None else p.to_dict(),
                 None if short is None else short.to_dict(),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
                 device.identity.sm_count,
                 device.identity.compute_capability,
             ),
@@ -1205,7 +1205,7 @@ def _plan_fixed_block_fp8_gemv(query, *, invocation, override):
         _compile_jobs=lambda config, device: (
             CompileJob.create(
                 "b12x.gemm.blockscaled._block_fp8_gemv:compile_block_fp8_gemv",
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
                 query.out_features,
                 query.in_features,
             ),
@@ -1320,7 +1320,7 @@ def _plan_fixed(query, *, invocation=FrozenMapping(), override=None):
                 "b12x.gemm.blockscaled._preparation:compile_fixed",
                 FIXED_TUNING.encode_query(query),
                 lower(device)[0].to_dict(),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
                 device.identity.sm_count,
             ),
         ),

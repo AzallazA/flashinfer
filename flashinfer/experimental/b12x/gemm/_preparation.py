@@ -246,7 +246,7 @@ def plan(query: DenseGemmQuery, *, invocation=FrozenMapping(), override=None):
             CompileJob.create(
                 "b12x._lib.dense_gemm.preparation:_compile_dense_lowering",
                 lower(config, device).to_dict(),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         ),
         _memory_requirements=memory,

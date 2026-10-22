@@ -111,7 +111,7 @@ class _EmbeddingProgram:
 
 @program_cache
 def compile_embedding(width, weight_dtype, id_dtype, device):
-    key = (width, str(weight_dtype), str(id_dtype), device)
+    key = (width, str(weight_dtype), str(id_dtype))
     q8 = weight_dtype == torch.uint8
     entry = _Embedding(width, q8)
     raise_if_kernel_resolution_frozen("cute.compile", target=entry, cache_key=key)

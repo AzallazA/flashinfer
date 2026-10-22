@@ -84,7 +84,7 @@ def plan(
             CompileJob.create(
                 "b12x.norm._vision_preparation:compile_vision",
                 TUNING.encode_query(query),
-                detected.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         ),
         _memory_requirements=lambda config, detected: MemoryRequirements(),

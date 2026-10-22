@@ -440,7 +440,7 @@ def plan(
             CompileJob.create(
                 "b12x.comm.pcie._twoshot_preparation:compile_twoshot_surface",
                 payload,
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

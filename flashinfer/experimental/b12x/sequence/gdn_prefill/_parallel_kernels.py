@@ -731,8 +731,7 @@ def compile_auxiliary(binding) -> Auxiliary:
     parallel = binding.parallel
     assert parallel is not None
     caps = binding._state.caps
-    key = (
-        binding.output.device.index,
+    compile_key = (
         caps.heads,
         caps.max_seqs,
         parallel._state.max_segments,
@@ -742,6 +741,7 @@ def compile_auxiliary(binding) -> Auxiliary:
         binding.initial_state_indices.dtype,
         parallel._state.reuse_outputs,
     )
+    key = (binding.output.device.index, *compile_key)
     if key in _CACHE:
         return _CACHE[key]
     geometry = dict(
@@ -799,7 +799,7 @@ def compile_auxiliary(binding) -> Auxiliary:
                 *args,
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
-                    f"sequence.gdn_prefill.{name}", 2, key
+                    f"sequence.gdn_prefill.{name}", 2, compile_key
                 ),
             )
         )

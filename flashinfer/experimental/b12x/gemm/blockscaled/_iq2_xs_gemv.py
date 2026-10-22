@@ -232,7 +232,7 @@ def compile_gemv(ordinal, n, k, tile_m, codec="iq2_xs"):
             Int32(1),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.iq2_xs.simt", 5, (ordinal, n, k, tile_m, codec)
+                "gemm.iq2_xs.simt", 5, (n, k, tile_m, codec)
             ),
         )
 

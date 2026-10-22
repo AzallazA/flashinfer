@@ -36,7 +36,7 @@ def make_plan(caps: Caps, *, invocation=FrozenMapping(), override=None):
             CompileJob.create(
                 "b12x.attention.mla_compress._preparation:compile_mla_compress",
                 TUNING.encode_query(query),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

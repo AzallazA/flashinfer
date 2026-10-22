@@ -355,6 +355,16 @@ class PreparationProgress:
     ready_cache: TuningCacheRequirement | None = None
     planned_requests: int = 0
     candidates_described: int = 0
+    restored_candidates: int = 0
+    rejected_candidates: int = 0
+
+    @property
+    def completed_candidates(self):
+        return (
+            self.measured_candidates
+            + self.restored_candidates
+            + self.rejected_candidates
+        )
 
 
 @dataclass(kw_only=True)
@@ -756,6 +766,8 @@ class PreparationResult:
         benchmark_closers=(),
         cache_hits=0,
         benchmarked_candidates=0,
+        restored_candidates=0,
+        rejected_candidates=0,
         elapsed_seconds=0.0,
         compilation=None,
         parent_cute_compilations=0,
@@ -780,6 +792,8 @@ class PreparationResult:
         self.benchmark_calls = MappingProxyType(dict(benchmark_calls or {}))
         self.cache_hits = cache_hits
         self.benchmarked_candidates = benchmarked_candidates
+        self.restored_candidates = restored_candidates
+        self.rejected_candidates = rejected_candidates
         self.elapsed_seconds = elapsed_seconds
         self.compilation = compilation
         self.parent_cute_compilations = parent_cute_compilations

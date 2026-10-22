@@ -321,7 +321,7 @@ def plan_hyperconnection(caps, *, invocation=FrozenMapping(), override=None):
                 "b12x.norm.hyperconnection._preparation:_compile_hyperconnection",
                 _program_query_payload(TUNING.encode_query(query)),
                 config.to_dict(),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         ),
         _memory_requirements=lambda config, device: MemoryRequirements(),

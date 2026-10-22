@@ -204,7 +204,6 @@ def _compile_w4a16_small_m_direct(
         compile_spec=KernelCompileSpec.from_facts(
             "moe.w4a16.small_m_direct",
             3,
-            ("device_index", None if device is None else int(device.index or 0)),
             ("m", int(m)),
             ("hidden_size", int(hidden_size)),
             ("intermediate_size", int(intermediate_size)),
@@ -343,7 +342,6 @@ def _compile_w4a16_fc2_direct(
         compile_spec=KernelCompileSpec.from_facts(
             "moe.w4a16.fc2_direct",
             5,
-            ("device_index", int(device.index or 0)),
             ("hidden_size", int(hidden_size)),
             ("intermediate_size", int(intermediate_size)),
             ("expert_capacity", int(expert_capacity)),

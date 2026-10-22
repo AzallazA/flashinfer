@@ -74,3 +74,41 @@ def test_tensor_facts_reject_explicit_policy_rank_mismatch(keyword, label):
         ValueError, match=f"{label} policy rank 1 does not match tensor rank 2"
     ):
         compiler.tensor_compile_fact("source", torch.empty(3, 32), **{keyword: (1,)})
+
+
+@pytest.mark.parametrize(
+    "builder", ["fact", "tensor_key", "legacy", "device", "structural"]
+)
+def test_tensor_program_facts_ignore_cuda_ordinals(builder):
+    from types import SimpleNamespace
+
+    torch = pytest.importorskip("torch")
+
+    def facts(ordinal):
+        device = torch.device("cuda", ordinal)
+        tensor = SimpleNamespace(
+            shape=(8, 32), stride=lambda: (32, 1), dtype=torch.bfloat16, device=device
+        )
+        if builder == "fact":
+            return compiler.tensor_compile_fact("source", tensor)
+        if builder == "tensor_key":
+            return compiler.KernelCompileSpec.from_key(
+                "test.tensor", 1, (compiler.tensor_key("source", tensor),)
+            ).json_key
+        if builder == "legacy":
+            key = compiler.TensorKey(
+                "source",
+                "torch.bfloat16",
+                2,
+                (compiler.DimKey.exact(8), compiler.DimKey.exact(32)),
+                (32, 1),
+                device.type,
+            )
+            return compiler.KernelCompileSpec.from_legacy_fields(
+                "test.tensor", 1, ("source", key)
+            ).json_key
+        if builder == "device":
+            return compiler._compile_spec_shape_key(device)
+        return compiler._structural_cache_key(device)
+
+    assert facts(0) == facts(1) == facts(15)

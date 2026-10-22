@@ -291,7 +291,7 @@ def _plan(query, device):
             CompileJob.create(
                 "b12x.attention.dsa_indexer.glm_pool:compile_pool",
                 payload,
-                detected.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         ),
         _memory_requirements=lambda config, detected: MemoryRequirements(),

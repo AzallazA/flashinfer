@@ -425,7 +425,7 @@ def make_plan(caps: LayerCaps, *, invocation, override):
                 "b12x.sequence.ple._preparation:compile_layer",
                 query_payload,
                 config.to_dict(),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

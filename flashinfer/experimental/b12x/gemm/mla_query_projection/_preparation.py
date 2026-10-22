@@ -119,7 +119,11 @@ def plan(query: ProjectionQuery, *, invocation=FrozenMapping(), override=None) -
             if query.weight_format == "bf16"
             else "b12x.gemm.mla_query_projection._preparation:compile_mxfp8"
         )
-        return (CompileJob.create(factory, TUNING.encode_query(query), device.ordinal),)
+        return (
+            CompileJob.create(
+                factory, TUNING.encode_query(query), CompileJob.DEVICE_ORDINAL
+            ),
+        )
 
     def materialize(selection, device):
         compiler = compile_bf16 if query.weight_format == "bf16" else compile_mxfp8

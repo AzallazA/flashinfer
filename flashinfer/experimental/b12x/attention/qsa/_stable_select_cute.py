@@ -185,7 +185,8 @@ def compile_stable_selection(budget, device, input_order=False, indices_only=Fal
         raise ValueError(
             "indices-only selection requires input ordering and an unsegmented score row"
         )
-    key = (device, int(budget), bool(input_order), bool(indices_only))
+    compile_key = (int(budget), bool(input_order), bool(indices_only))
+    key = (device, compile_key)
     raw = _CACHE.get(key)
     if raw is None:
         kernel = StableSelectionKernel(budget, input_order, indices_only)
@@ -202,7 +203,9 @@ def compile_stable_selection(budget, device, input_order=False, indices_only=Fal
             Int32(0),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "attention.qsa.stable_selection", 3, key
+                "attention.qsa.stable_selection",
+                3,
+                compile_key,
             ),
         )
         _CACHE[key] = raw

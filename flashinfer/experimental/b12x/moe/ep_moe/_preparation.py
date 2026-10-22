@@ -289,7 +289,7 @@ def plan(
                     TUNING.encode_query(query),
                     invocation.to_dict(),
                     weights,
-                    device.ordinal,
+                    CompileJob.DEVICE_ORDINAL,
                 ),
             )
 

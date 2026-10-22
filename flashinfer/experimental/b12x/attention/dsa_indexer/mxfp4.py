@@ -1008,7 +1008,7 @@ def _compile(kind: str, recipe: tuple, device_index: int):
         obj = _SortPositions(*recipe)
         dtypes = (Int32, Float32, Int32, Float32, Int32, Int32, Int32)
         scalars = (Int32(1),)
-    key = (kind, recipe, device_index)
+    key = (kind, recipe)
     raise_if_kernel_resolution_frozen("cute.compile", target=obj, cache_key=key)
     pointers = tuple(
         make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=1) for t in dtypes

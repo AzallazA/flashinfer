@@ -178,7 +178,7 @@ def plan(query, *, invocation=FrozenMapping(), override=None):
                 "b12x.gemm.hyperconnection_gate._preparation:compile_gate",
                 TUNING.encode_query(query),
                 TUNING.encode_config(config),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         ),
         _memory_requirements=lambda config, device: MemoryRequirements(),

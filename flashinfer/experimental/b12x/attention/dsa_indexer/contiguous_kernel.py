@@ -272,12 +272,12 @@ def _to_kernel_tensor(
 
 def _tensor_meta_key(
     tensor: torch.Tensor,
-) -> tuple[tuple[int, ...], tuple[int, ...], str, tuple[str, int | None]]:
+) -> tuple[tuple[int, ...], tuple[int, ...], str, str]:
     return (
         tuple(tensor.shape),
         tuple(tensor.stride()),
         str(tensor.dtype),
-        (tensor.device.type, tensor.device.index),
+        tensor.device.type,
     )
 
 

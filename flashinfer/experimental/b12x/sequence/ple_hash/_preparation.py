@@ -272,7 +272,7 @@ def make_plan(
                 "b12x.sequence.ple_hash._preparation:compile_hash",
                 TUNING.encode_query(query),
                 config.to_dict(),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

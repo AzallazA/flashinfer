@@ -239,7 +239,7 @@ def plan(
             CompileJob.create(
                 "b12x.quantization.mxfp8._preparation:compile_mxfp8_rows",
                 TUNING.encode_query(query),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
                 device.identity.sm_count,
             ),
         ),

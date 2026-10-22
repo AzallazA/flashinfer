@@ -280,7 +280,7 @@ def make_plan(
                 "b12x.sequence.engram._preparation:compile_engram",
                 TUNING.encode_query(query),
                 TUNING.encode_config(config),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         ),
         _memory_requirements=memory,

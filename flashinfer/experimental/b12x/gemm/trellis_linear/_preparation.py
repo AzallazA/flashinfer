@@ -274,7 +274,7 @@ def plan(
                 "b12x.gemm.trellis_linear._preparation:_compile_trellis",
                 TUNING.encode_query(replace(query, autotune_effort="medium")),
                 TUNING.encode_config(config),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
                 device.identity.sm_count,
             ),
         )

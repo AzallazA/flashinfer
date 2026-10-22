@@ -237,6 +237,8 @@ class PreparationDisplay:
             progress.candidates_prepared,
             progress.completed_rounds,
             progress.measured_candidates,
+            progress.restored_candidates,
+            progress.rejected_candidates,
             progress.cache_hits,
             progress.compilations,
             progress.active_compilations,
@@ -379,6 +381,7 @@ class PreparationDisplay:
         line = (
             f"b12x {phase}{component}: {p.completed_requests}/{p.total_requests} ready"
             f"{candidates}{batch}{rounds}, {p.measured_candidates} measured, {p.cache_hits} cached, "
+            f"{p.restored_candidates} restored, {p.rejected_candidates} rejected, "
             f"{p.compilations} compilations, {_duration(self._elapsed())}{stopped}"
         )
         self._stream.write(_plain(line) + "\n")
@@ -488,9 +491,14 @@ class PreparationDisplay:
                 ),
             )
         if p.total_candidates:
-            fraction = p.measured_candidates / p.total_candidates
+            fraction = p.completed_candidates / p.total_candidates
+            outcome = (
+                "complete"
+                if p.restored_candidates or p.rejected_candidates
+                else "measured"
+            )
             label = Text(
-                f"{p.measured_candidates} / {p.total_candidates} candidates measured",
+                f"{p.completed_candidates} / {p.total_candidates} candidates {outcome}",
                 style=_INK,
                 no_wrap=True,
             )
@@ -573,10 +581,15 @@ class PreparationDisplay:
 
     def _summary_row(self, frame):
         p = frame.progress
+        detail = f"{p.compilations} compiled  ·  {p.cache_hits} cached  ·  {p.measured_candidates} measured"
+        if p.restored_candidates:
+            detail += f"  ·  {p.restored_candidates} restored"
+        if p.rejected_candidates:
+            detail += f"  ·  {p.rejected_candidates} rejected"
         return self._field(
             "TOTAL",
             f"{p.completed_requests} requests",
-            f"{p.compilations} compiled  ·  {p.cache_hits} cached  ·  {p.measured_candidates} measured",
+            detail,
         )
 
     def _render_line(self, frame, width):
@@ -591,7 +604,7 @@ class PreparationDisplay:
         if not show_hint:
             if p.total_candidates:
                 line.append(
-                    f"  {p.measured_candidates}/{p.total_candidates} candidates",
+                    f"  {p.completed_candidates}/{p.total_candidates} candidates",
                     style=_INK,
                 )
             else:

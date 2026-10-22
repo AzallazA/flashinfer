@@ -187,7 +187,7 @@ def plan(
             CompileJob.create(
                 "b12x.attention.compressed_sparse_mla.cache_writer:compile_cache_writer",
                 query.to_dict(),
-                detected.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

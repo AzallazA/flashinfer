@@ -158,7 +158,7 @@ def plan(query: GemvQuery, *, invocation=FrozenMapping(), override=None) -> Plan
                 "b12x.gemm.bf16_gemv._preparation:compile_gemv",
                 compile_query,
                 TUNING.encode_config(config),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

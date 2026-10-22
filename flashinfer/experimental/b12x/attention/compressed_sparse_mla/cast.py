@@ -81,7 +81,7 @@ class _CastProgram:
 
 @program_cache
 def _compile_cast(input_dtype, output_dtype, device):
-    key = (input_dtype, output_dtype, device)
+    key = (input_dtype, output_dtype)
     entry = _Cast(output_dtype == torch.float32)
     raise_if_kernel_resolution_frozen("cute.compile", target=entry, cache_key=key)
     types = tuple(
@@ -166,7 +166,7 @@ def plan(query: Query, *, device, invocation=FrozenMapping(), override=None):
             CompileJob.create(
                 "b12x.attention.compressed_sparse_mla.cast:compile_cast",
                 TUNING.encode_query(query),
-                detected.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

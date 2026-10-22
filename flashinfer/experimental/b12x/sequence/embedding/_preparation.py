@@ -85,7 +85,7 @@ def plan(query: EmbeddingQuery, *, device, invocation=FrozenMapping(), override=
             CompileJob.create(
                 "b12x.sequence.embedding._preparation:compile_lookup",
                 TUNING.encode_query(query),
-                detected.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

@@ -442,7 +442,7 @@ def compile_scan(geometry, ordinal):
         BFloat16,
     )
     entry = _Scan(q)
-    key = (geometry, ordinal)
+    key = (geometry,)
     raise_if_kernel_resolution_frozen("cute.compile", target=entry, cache_key=key)
     pointers = tuple(
         make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=max(1, t.width // 8))

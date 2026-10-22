@@ -492,7 +492,7 @@ def plan(
                 payload,
                 TUNING.config_payload(config),
                 invocation,
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
                 asdict(device.identity),
             ),
         )

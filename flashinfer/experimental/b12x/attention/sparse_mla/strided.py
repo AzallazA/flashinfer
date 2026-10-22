@@ -374,7 +374,7 @@ def plan(
             CompileJob.create(
                 "b12x.attention.sparse_mla.strided:compile_strided_sparse_mla",
                 caps,
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         ),
         _memory_requirements=lambda config, device: MemoryRequirements(

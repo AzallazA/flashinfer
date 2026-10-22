@@ -366,7 +366,7 @@ def plan_pooled_selection(
             CompileJob.create(
                 "b12x.attention.sparse_mla.pooled_selection:compile_pooled_selection",
                 payload,
-                detected.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         ),
         _memory_requirements=lambda config, detected: MemoryRequirements(),

@@ -580,7 +580,7 @@ def plan(
                 "b12x.sequence.gdn_decode._preparation:compile_decode",
                 query.to_dict(),
                 TUNING.encode_config(config),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

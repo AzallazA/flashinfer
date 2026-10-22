@@ -204,9 +204,7 @@ def compile_block_fp8_gemv(ordinal: int, n: int, k: int):
             *fake,
             Int32(1),
             current_cuda_stream(),
-            compile_spec=KernelCompileSpec.from_key(
-                "gemm.block_fp8.gemv", 2, (ordinal, n, k)
-            ),
+            compile_spec=KernelCompileSpec.from_key("gemm.block_fp8.gemv", 2, (n, k)),
         )
 
     def run(lhs, lhs_scale, rhs, rhs_scale, output, stream=None):

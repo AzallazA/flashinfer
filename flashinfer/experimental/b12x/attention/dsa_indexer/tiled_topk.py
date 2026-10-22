@@ -533,7 +533,7 @@ def _tensor_meta_key(tensor, *, dynamic_dims=()):
         ),
         tuple(tensor.stride()),
         str(tensor.dtype),
-        (tensor.device.type, tensor.device.index),
+        tensor.device.type,
     )
 
 
@@ -542,7 +542,7 @@ def _flat_tensor_meta_key(tensor):
         (int(tensor.numel()),),
         (1,),
         str(tensor.dtype),
-        (tensor.device.type, tensor.device.index),
+        tensor.device.type,
     )
 
 

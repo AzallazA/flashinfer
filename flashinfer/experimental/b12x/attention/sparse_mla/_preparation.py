@@ -349,7 +349,7 @@ def plan(
             CompileJob.create(
                 "b12x.attention.sparse_mla._preparation:compile_sparse_mla",
                 caps,
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
                 query.prefill_mg_enabled,
             ),
         ),
@@ -465,7 +465,7 @@ def plan_cache_writer(
             CompileJob.create(
                 "b12x.attention.sparse_mla._preparation:compile_cache_writer",
                 payload,
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         ),
         _memory_requirements=lambda config, device: MemoryRequirements(),

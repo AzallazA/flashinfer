@@ -278,7 +278,7 @@ def plan(query: Mxfp6DenseQuery, *, invocation=FrozenMapping(), override=None) -
                 "b12x.quantization.mxfp6._preparation:compile_mxfp6_dense",
                 TUNING.encode_query(query),
                 TUNING.encode_config(config),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
                 device.identity.sm_count,
             ),
         )

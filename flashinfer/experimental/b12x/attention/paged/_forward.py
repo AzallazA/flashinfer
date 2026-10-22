@@ -373,7 +373,7 @@ def _tensor_meta_key(
     *,
     dynamic_dims: tuple[int, ...] = (),
     dynamic_strides: tuple[int, ...] = (),
-) -> tuple[tuple[object, ...], tuple[object, ...], str, tuple[str, int | None]] | None:
+) -> tuple[tuple[object, ...], tuple[object, ...], str, str] | None:
     if tensor is None:
         return None
     dynamic_dim_set = set(dynamic_dims)
@@ -388,13 +388,13 @@ def _tensor_meta_key(
             for idx, stride in enumerate(tensor.stride())
         ),
         str(tensor.dtype),
-        (tensor.device.type, tensor.device.index),
+        tensor.device.type,
     )
 
 
 def _paged_kv_cache_meta_key(
     tensor: torch.Tensor | None,
-) -> tuple[tuple[object, ...], tuple[object, ...], str, tuple[str, int | None]] | None:
+) -> tuple[tuple[object, ...], tuple[object, ...], str, str] | None:
     # K/V cache page capacity is runtime storage capacity. The selected kernel
     # policy depends on page layout, dtype, heads, and strides, not total pages.
     return _tensor_meta_key(tensor, dynamic_dims=(0,))

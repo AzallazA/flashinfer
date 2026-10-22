@@ -206,7 +206,7 @@ def plan(
             CompileJob.create(
                 "b12x.comm.pcie._dma_preparation:compile_dma_surface",
                 payload,
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

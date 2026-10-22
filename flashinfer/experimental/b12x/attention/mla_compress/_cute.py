@@ -278,7 +278,7 @@ def pointers(tensors):
 
 @lru_cache(maxsize=None)
 def compile_compress(ratio, max_tokens, max_requests, max_states, device_index):
-    key = (ratio, max_tokens, max_requests, max_states, device_index)
+    key = (ratio, max_tokens, max_requests, max_states)
     entry = _Compress(ratio, max_tokens, max_requests, max_states)
     raise_if_kernel_resolution_frozen("cute.compile", target=entry, cache_key=key)
     types = list(_DTYPES)

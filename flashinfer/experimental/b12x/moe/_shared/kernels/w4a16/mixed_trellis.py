@@ -1813,14 +1813,14 @@ def compile_mixed_trellis(
             f"limit={int(max_shared_mem)}"
         )
     device = int(torch.cuda.current_device())
-    cache_key = (
+    compile_key = (
         "mixed_trellis",
-        device,
         kernel.__cache_key__,
         str(route_ids_dtype),
         int(size_m),
         int(max_m_blocks),
     )
+    cache_key = (device, compile_key)
     topk_sum = compile_w4a16_topk_sum(
         m=size_m,
         topk=top_k,
@@ -1918,7 +1918,9 @@ def compile_mixed_trellis(
         kernel,
         *compile_args,
         compile_spec=KernelCompileSpec.from_key(
-            "moe.w4a16.mixed_trellis", W4A16MixedTrellisKernel.ABI_VERSION, cache_key
+            "moe.w4a16.mixed_trellis",
+            W4A16MixedTrellisKernel.ABI_VERSION,
+            compile_key,
         ),
         dsl_compile_options=OptLevel(2),
     )
@@ -2071,14 +2073,14 @@ def compile_mixed_trellis3(
             f"required={kernel.shared_words * 4} limit={int(max_shared_mem)}"
         )
     device = int(torch.cuda.current_device())
-    cache_key = (
+    compile_key = (
         "mixed_trellis3",
-        device,
         kernel.__cache_key__,
         str(route_ids_dtype),
         int(size_m),
         int(max_m_blocks),
     )
+    cache_key = (device, compile_key)
     topk_sum = compile_w4a16_topk_sum(
         m=size_m,
         topk=top_k,
@@ -2177,7 +2179,7 @@ def compile_mixed_trellis3(
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.mixed_trellis3",
             W4A16MixedTrellis3Kernel.ABI_VERSION,
-            cache_key,
+            compile_key,
         ),
         dsl_compile_options=OptLevel(2),
     )

@@ -636,7 +636,7 @@ def plan(
             CompileJob.create(
                 "b12x.comm.pcie._oneshot_preparation:compile_oneshot_surface",
                 TUNING.encode_query(query),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         ),
         _memory_requirements=lambda config, device: MemoryRequirements(

@@ -1480,19 +1480,19 @@ def plan(
                     TUNING.encode_config(config),
                     weight_payload,
                     scale_counts,
-                    device.ordinal,
+                    CompileJob.DEVICE_ORDINAL,
                 ),
                 CompileJob.create(
                     "b12x.moe.fused_moe._preparation:compile_route_topk",
                     ROUTE_TUNING.encode_query(route_query),
-                    device.ordinal,
+                    CompileJob.DEVICE_ORDINAL,
                 ),
                 *(
                     (
                         CompileJob.create(
                             "b12x.moe.fused_moe._preparation:compile_nvfp4_csf_programs",
                             lsc_payload,
-                            device.ordinal,
+                            CompileJob.DEVICE_ORDINAL,
                         ),
                     )
                     if lsc_payload and expansion is None
@@ -1502,7 +1502,7 @@ def plan(
                     CompileJob.create(
                         "b12x.moe.fused_moe._preparation:compile_dynamic_route_plan",
                         payload,
-                        device.ordinal,
+                        CompileJob.DEVICE_ORDINAL,
                     )
                     for payload in _dynamic_route_plan_payloads(launch_plan, caps)
                 ),
@@ -1818,7 +1818,7 @@ def plan_route_topk(
             CompileJob.create(
                 "b12x.moe.fused_moe._preparation:compile_route_topk",
                 ROUTE_TUNING.encode_query(query),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 
@@ -1887,7 +1887,7 @@ def plan_fc2(
             CompileJob.create(
                 "b12x.moe.fused_moe._preparation:compile_fc2",
                 FC2_TUNING.encode_query(query),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

@@ -162,7 +162,9 @@ def plan(
     def jobs(config, device):
         return (
             CompileJob.create(
-                "b12x.comm.roce._preparation:compile_roce", payload, device.ordinal
+                "b12x.comm.roce._preparation:compile_roce",
+                payload,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

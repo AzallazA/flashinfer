@@ -141,7 +141,6 @@ def compile_rotation(payload, ordinal):
         query.inverse,
         query.ratio,
         cs_dtype,
-        ordinal,
     )
     entry = _Rotate(query.heads, query.dim, query.rope_dim, query.inverse, query.ratio)
     types = (
@@ -244,7 +243,7 @@ def plan(query: Query, *, device, invocation=FrozenMapping(), override=None) -> 
             CompileJob.create(
                 "b12x.attention.compressed_sparse_mla.rotary:compile_rotation",
                 TUNING.encode_query(query),
-                detected.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

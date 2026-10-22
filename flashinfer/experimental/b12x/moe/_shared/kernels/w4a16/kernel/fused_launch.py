@@ -517,11 +517,8 @@ def compile_w4a16_fused_moe(
         small_m_occupancy=small_m_occupancy,
         csf_inline_scales=csf_inline_scales,
     )
-    cache_key = (
-        "w4a16_fused_moe",
-        device,
-        kernel.__cache_key__,
-    )
+    compile_key = ("w4a16_fused_moe", kernel.__cache_key__)
+    cache_key = (device, compile_key)
     cached = _FUSED_CACHE.get(cache_key)
     if cached is None and _require_cached:
         raise RuntimeError(
@@ -752,7 +749,7 @@ def compile_w4a16_fused_moe(
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.fused_moe",
             8,
-            cache_key,
+            compile_key,
         ),
         dsl_compile_options=OptLevel(2),
     )

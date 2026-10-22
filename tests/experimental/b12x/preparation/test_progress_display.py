@@ -448,7 +448,10 @@ def test_batch_change_resets_measurements_when_intermediate_rounds_are_not_repor
     assert "rank 2 batch 3" in _render_text(display, console)
 
 
-def test_progress_bar_measures_candidate_work_independently_of_request_count():
+@pytest.mark.parametrize("restored,rejected", [(0, 0), (800, 5)])
+def test_progress_bar_measures_candidate_work_independently_of_request_count(
+    restored, rejected
+):
     display, console = _attach(180, 40)
     display.update(
         _progress(
@@ -457,7 +460,9 @@ def test_progress_bar_measures_candidate_work_independently_of_request_count():
             request_name="mhc.post_pre.m4096",
             completed_requests=1,
             total_requests=100,
-            measured_candidates=900,
+            measured_candidates=900 - restored - rejected,
+            restored_candidates=restored,
+            rejected_candidates=rejected,
             total_candidates=1000,
             candidate_count=43,
             global_candidate_count=172,
@@ -469,7 +474,10 @@ def test_progress_bar_measures_candidate_work_independently_of_request_count():
         )
     )
     text = _render_text(display, console)
-    assert "900 / 1000 candidates measured" in text
+    assert f"900 / 1000 candidates {'complete' if restored else 'measured'}" in text
+    if restored:
+        assert f"{restored} restored" in text
+        assert f"{rejected} rejected" in text
     assert "90%" in text
     assert "20 in batch" in text
     assert "43 on rank / 172 total" in text

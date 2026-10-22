@@ -683,7 +683,7 @@ def compile_chunked(geometry, config_payload, ordinal):
     )
     entry, key = (
         _Chunked(q, MambaConfig(**dict(config_payload))),
-        (geometry, config_payload, ordinal),
+        (geometry, config_payload),
     )
     raise_if_kernel_resolution_frozen("cute.compile", target=entry, cache_key=key)
     pointers = tuple(

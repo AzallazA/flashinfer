@@ -644,7 +644,7 @@ def make_plan(caps, *, invocation=None, override=None) -> Plan:
                 "b12x.attention.paged_decode._preparation:compile_paged_decode",
                 compile_query,
                 config.to_dict(),
-                detected.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

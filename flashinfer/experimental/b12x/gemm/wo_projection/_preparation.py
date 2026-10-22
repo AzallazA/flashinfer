@@ -310,19 +310,19 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
             CompileJob.create(
                 "b12x._lib.dense_gemm.preparation:_compile_dense_lowering",
                 ordinary_states(config, device)[0].to_dict(),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
             CompileJob.create(
                 "b12x._lib.dense_gemm.preparation:_compile_dense_lowering",
                 ordinary_states(config, device)[1].to_dict(),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
             *(
                 (
                     CompileJob.create(
                         "b12x._lib.dense_gemm.preparation:_compile_dense_fused_quant_lowering",
                         fused_b(config, device).to_dict(),
-                        device.ordinal,
+                        CompileJob.DEVICE_ORDINAL,
                     ),
                 )
                 if use_fused_b
@@ -331,7 +331,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
             CompileJob.create(
                 "b12x.gemm._shared.wo_mxfp8:compile_wo_quantizers",
                 _compile_query_payload(query),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         ),
         _memory_requirements=memory,

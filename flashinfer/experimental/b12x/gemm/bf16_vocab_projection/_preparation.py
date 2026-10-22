@@ -88,7 +88,7 @@ def make_plan(caps: Caps, *, invocation=FrozenMapping(), override=None) -> Plan:
                 "b12x.gemm.bf16_vocab_projection._preparation:compile_vocab_projection",
                 _compile_query_payload(query),
                 config.to_dict(),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

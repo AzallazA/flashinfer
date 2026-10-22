@@ -89,11 +89,8 @@ def compile_w4a16_gemm(
         dense_route_fast_path=bool(dense_route_fast_path),
         schedule_whole_tiles=weight_layout == "trellis_t256",
     )
-    cache_key = (
-        "w4a16_gemm",
-        device,
-        kernel.__cache_key__,
-    )
+    compile_key = ("w4a16_gemm", kernel.__cache_key__)
+    cache_key = (device, compile_key)
     cached = _CACHE.get(cache_key)
     if cached is not None:
         return attach_programs(
@@ -201,7 +198,7 @@ def compile_w4a16_gemm(
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.gemm",
             4,
-            cache_key,
+            compile_key,
         ),
     )
     result = W4A16GemmCompileResult(

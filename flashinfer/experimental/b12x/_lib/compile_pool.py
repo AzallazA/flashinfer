@@ -14,7 +14,7 @@ from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 from multiprocessing.pool import Pool
 from threading import Condition, Lock
-from typing import Any, Iterable
+from typing import Any, ClassVar, Iterable
 
 # Job factories select entrypoints whose source dependencies are keyed separately.
 __b12x_source_dependencies__ = ()
@@ -55,9 +55,15 @@ def _validate_metadata(value):
     raise TypeError(f"compile jobs accept metadata only, not {type(value).__name__}")
 
 
+class _DeviceArgument(Enum):
+    ORDINAL = "device_ordinal"
+
+
 @dataclass(frozen=True, kw_only=True)
 class CompileJob:
     """An importable metadata factory, not itself a compiled-program identity."""
+
+    DEVICE_ORDINAL: ClassVar = _DeviceArgument.ORDINAL
 
     factory: str
     args: tuple[object, ...] = ()
@@ -88,6 +94,21 @@ class CompileJob:
             factory=factory, args=tuple(args), kwargs=tuple(sorted(kwargs.items()))
         )
 
+    def invoke(self):
+        """Bind execution placement to the caller's selected device."""
+
+        def bind(value):
+            if value is self.DEVICE_ORDINAL:
+                import torch
+
+                return torch.cuda.current_device()
+            return value
+
+        return _factory(self.factory)(
+            *(bind(value) for value in self.args),
+            **{key: bind(value) for key, value in self.kwargs},
+        )
+
 
 def _factory(reference):
     module, _, attribute = reference.partition(":")
@@ -108,7 +129,7 @@ class CompilationPlan:
 def describe_compilation(job: CompileJob) -> CompilationPlan:
     """Run only the factory's metadata construction, without lowering or launch."""
     with plan_compilations() as observed:
-        value = _factory(job.factory)(*job.args, **dict(job.kwargs))
+        value = job.invoke()
         returned = program_keys(value)
     if not returned:
         raise ValueError(
@@ -137,7 +158,7 @@ def compile_in_process(plans: Iterable[CompilationPlan]) -> None:
     for plan in plans:
         job = plan.job
         with serialized_compilations():
-            _factory(job.factory)(*job.args, **dict(job.kwargs))
+            job.invoke()
 
 
 _WORKER_TRITON_COMPILES = 0
@@ -278,9 +299,7 @@ def _initialize_worker(
     torch.cuda.device = device_scope
     torch.cuda.get_device_capability = get_device_capability
     torch.cuda.get_device_properties = get_device_properties
-    torch.cuda.get_device_name = lambda device=None: (
-        get_device_properties(device).name
-    )
+    torch.cuda.get_device_name = lambda device=None: get_device_properties(device).name
     torch.cuda.current_stream = current_stream
     torch.cuda.default_stream = current_stream
     torch.cuda.is_current_stream_capturing = lambda: False
@@ -437,7 +456,7 @@ def _run_job(payload: bytes, expected: tuple[ProgramKey, ...]):
     before_triton = _WORKER_TRITON_COMPILES
     try:
         with observe_programs() as observed, serialized_compilations():
-            result = _factory(job.factory)(*job.args, **dict(job.kwargs))
+            result = job.invoke()
             actual = set(program_keys(result))
         if not observed <= actual or actual != set(expected):
 

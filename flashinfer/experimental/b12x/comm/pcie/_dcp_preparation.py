@@ -299,7 +299,9 @@ def plan(
         raise ValueError("DCP invocation semantics belong in PcieQuery")
 
     def materialize(selection, device):
-        launchers = load_programs(compile_dcp_surface(TUNING.encode_query(query), device.ordinal))
+        launchers = load_programs(
+            compile_dcp_surface(TUNING.encode_query(query), device.ordinal)
+        )
         return _DcpExecutionState(query, runtime, MappingProxyType(dict(launchers)))
 
     resident = int(getattr(runtime, "_slot_bytes", 0)) * 2
@@ -312,7 +314,7 @@ def plan(
             CompileJob.create(
                 "b12x.comm.pcie._dcp_preparation:compile_dcp_surface",
                 TUNING.encode_query(query),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         ),
         _memory_requirements=lambda config, device: MemoryRequirements(

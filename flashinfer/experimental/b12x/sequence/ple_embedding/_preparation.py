@@ -307,7 +307,7 @@ def make_plan(
                 "b12x.sequence.ple_embedding._preparation:compile_embedding",
                 TUNING.encode_query(query),
                 config.to_dict(),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

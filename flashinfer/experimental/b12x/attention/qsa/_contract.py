@@ -1641,7 +1641,7 @@ def plan(
                 "b12x.attention.qsa._contract:compile_qsa",
                 query.program_payload(),
                 TUNING.encode_config(config),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         ),
         _memory_requirements=lambda config, _device: MemoryRequirements(

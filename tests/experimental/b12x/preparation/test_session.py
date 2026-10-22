@@ -790,6 +790,165 @@ def test_race_batches_bound_residency_and_carry_the_champion(tmp_path, monkeypat
     assert sorted(trial_closed) == [3, 6, 12, 24]
 
 
+def test_interrupted_race_restores_batches_and_retimes_the_champion(
+    tmp_path, monkeypatch
+):
+    batches, attempted, compiled = [], [], []
+    _deterministic_timer(monkeypatch, batches=batches)
+    original_measure = PreparationJob._measure
+    original_compile = PreparationJob._compile
+
+    def interrupted(job, trials, **kwargs):
+        if job._batch_index == 2:
+            raise RuntimeError("interrupted batch")
+        return (yield from original_measure(job, trials, **kwargs))
+
+    def compile_candidate(job, obligation, config, **kwargs):
+        compiled.append(config.width)
+        return (yield from original_compile(job, obligation, config, **kwargs))
+
+    def benchmark(state):
+        attempted.append(state.value)
+        return PreparedCall(run=lambda: state.value, produce=lambda: None)
+
+    def requests():
+        return (
+            request(
+                name="race",
+                tuning=contract(values=(1, 2, 4, 8, 16)),
+                benchmark=benchmark,
+            ),
+        )
+
+    monkeypatch.setattr(PreparationJob, "_measure", interrupted)
+    with session(tmp_path, race_batch=2) as engine:
+        with pytest.raises(RuntimeError, match="interrupted batch"):
+            engine.prepare(requests())
+        assert not engine._cache.records
+    assert batches == [(3, 6)]
+    attempted.clear()
+    batches.clear()
+    monkeypatch.setattr(PreparationJob, "_measure", original_measure)
+    monkeypatch.setattr(PreparationJob, "_compile", compile_candidate)
+    from b12x.preparation import _measurement
+
+    def changed_timings(race, **kwargs):
+        yield
+        return _measurement.RaceMeasurements(
+            tuple(abs(call.output - 12) + 1 for call in race.calls), 0
+        )
+
+    monkeypatch.setattr(_measurement, "measure_race_steps", changed_timings)
+    snapshots = []
+    with session(tmp_path, race_batch=2) as engine:
+        result = engine.prepare(requests(), progress=snapshots.append)
+        assert result.benchmarked_candidates == 3
+        assert result.restored_candidates == 2
+        assert result.coverage["race"]["measured_count"] == 5
+        assert result.selections["race"].config.width == 4
+        assert snapshots[-1].completed_candidates == snapshots[-1].total_candidates == 5
+    assert batches == [(6, 12, 24), (12, 48)]
+    assert attempted == [6, 12, 24, 48]
+    assert 1 not in compiled
+
+
+def test_completed_shard_restores_before_winner_consolidation(tmp_path, monkeypatch):
+    _deterministic_timer(monkeypatch)
+
+    def requests():
+        return tuple(
+            replace(
+                req := request(
+                    name=f"race-{i}",
+                    tuning=contract(values=(1, 2, 4, 8)),
+                    benchmark=lambda state: PreparedCall(
+                        run=lambda: state.value, produce=lambda: None
+                    ),
+                ),
+                plan=replace(req.plan, query=Query(i + 3)),
+            )
+            for i in range(2)
+        )
+
+    def advance_to_exchange(engine):
+        engine.configure_tuning_shard(0, (0, 1))
+        job = engine.begin(requests())
+        snapshot = job.advance().ready_cache
+        progress = job.advance(cache=(snapshot, snapshot))
+        while not progress.ready_tuning:
+            progress = job.advance()
+        return job, progress
+
+    with session(tmp_path) as engine:
+        job, progress = advance_to_exchange(engine)
+        contributions = progress.ready_tuning
+        assert len(contributions) == 2
+        assert not engine._cache.records
+        job.close()
+
+    monkeypatch.setattr(
+        PreparationJob, "_trial", lambda *args: pytest.fail("completed shard retuned")
+    )
+    with session(tmp_path) as engine:
+        job, progress = advance_to_exchange(engine)
+        assert progress.ready_tuning == contributions
+        assert progress.measured_candidates == 0
+        assert progress.restored_candidates == 4
+        progress = job.advance(tuning=contributions)
+        while not progress.done:
+            progress = job.advance()
+        assert len(engine._cache.records) == 2
+        assert job.result().restored_candidates == 4
+
+
+@pytest.mark.parametrize("changed", ("query", "rounds", "samples", "shards"))
+def test_race_checkpoint_identity_preserves_workload_and_measurement_contract(
+    tmp_path, monkeypatch, changed
+):
+    _deterministic_timer(monkeypatch)
+    measure = PreparationJob._measure
+
+    def crash(job, trials, **kwargs):
+        if job._batch_index == 2:
+            raise RuntimeError("interrupted batch")
+        return (yield from measure(job, trials, **kwargs))
+
+    def req():
+        return request(
+            name="race",
+            tuning=contract(values=(1, 2, 4, 8)),
+            benchmark=lambda state: PreparedCall(
+                run=lambda: state.value, produce=lambda: None
+            ),
+        )
+
+    monkeypatch.setattr(PreparationJob, "_measure", crash)
+    with session(tmp_path, race_batch=1) as engine:
+        with pytest.raises(RuntimeError, match="interrupted batch"):
+            engine.prepare((req(),))
+    monkeypatch.setattr(PreparationJob, "_measure", measure)
+    options = (
+        {changed: getattr(engine, changed) + 1}
+        if changed in ("rounds", "samples")
+        else {}
+    )
+    with session(tmp_path, race_batch=1, **options) as engine:
+        request_ = req()
+        if changed == "query":
+            request_ = replace(request_, plan=replace(request_.plan, query=Query(13)))
+        if changed == "shards":
+            engine.configure_tuning_shard(0, (0, 1))
+            job = engine.begin((request_,))
+            snapshot = job.advance().ready_cache
+            progress = job.advance(cache=(snapshot, snapshot))
+            while not progress.ready_tuning:
+                progress = job.advance()
+            assert progress.restored_candidates == 0
+            job.close()
+        else:
+            assert engine.prepare((request_,)).restored_candidates == 0
+
+
 def _cuda_error(monkeypatch, code=720):
     from cutlass.base_dsl import common
 
@@ -800,6 +959,65 @@ def _cuda_error(monkeypatch, code=720):
         lambda code, name: (f"{name} ({code})", "", ""),
     )
     return common.DSLCudaRuntimeError(code, "test CUDA launch error")
+
+
+def test_rejected_restored_champion_reconsiders_losers_and_retries_after_restart(
+    tmp_path, monkeypatch
+):
+    _deterministic_timer(monkeypatch)
+    measure = PreparationJob._measure
+    error = _cuda_error(monkeypatch)
+    attempted, rejected = [], set()
+
+    def interrupt(job, trials, **kwargs):
+        if job._batch_index == 2:
+            raise RuntimeError("interrupted batch")
+        return (yield from measure(job, trials, **kwargs))
+
+    def benchmark(state):
+        attempted.append(state.value)
+
+        def run():
+            if state.value in rejected:
+                raise error
+            return state.value
+
+        return PreparedCall(run=run, produce=lambda: None)
+
+    def req():
+        return request(
+            name="race", tuning=contract(values=(1, 2, 4, 8)), benchmark=benchmark
+        )
+
+    monkeypatch.setattr(PreparationJob, "_measure", interrupt)
+    with session(tmp_path, race_batch=2) as engine:
+        with pytest.raises(RuntimeError, match="interrupted batch"):
+            engine.prepare((req(),))
+
+    monkeypatch.setattr(PreparationJob, "_measure", measure)
+    rejected.add(6)
+    attempted.clear()
+    with session(tmp_path, race_batch=2) as engine:
+        result = engine.prepare((req(),))
+        assert result.restored_candidates == 0
+        assert result.benchmarked_candidates == 3
+        assert result.rejected_candidates == 1
+        assert result.coverage["race"]["measured_count"] == 3
+        assert result.selections["race"].config.width == 1
+        assert not engine._cache.records
+    assert attempted == [6, 3, 6, 12, 24]
+
+    rejected.clear()
+    attempted.clear()
+    with session(tmp_path, race_batch=2) as engine:
+        result = engine.prepare((req(),))
+        assert result.restored_candidates == 3
+        assert result.benchmarked_candidates == 1
+        assert result.rejected_candidates == 0
+        assert result.coverage["race"]["measured_count"] == 4
+        assert result.selections["race"].config.width == 2
+        assert engine._cache.records
+    assert attempted == [3, 6]
 
 
 @pytest.mark.parametrize("rejected", ((3,), (12,), (3, 6)))

@@ -180,7 +180,7 @@ def make_plan(caps, *, invocation=None, override=None):
             CompileJob.create(
                 "b12x.attention.paged_kv_write._preparation:compile_writer",
                 TUNING.encode_query(query),
-                detected.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

@@ -681,7 +681,7 @@ def plan(
                 "b12x.attention.compressed_sparse_mla._preparation:compile_compressed_sparse_mla",
                 payload,
                 TUNING.encode_config(config),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

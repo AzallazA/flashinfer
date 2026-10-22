@@ -4,6 +4,8 @@ The session fills each plan's prepared slot in place. Plans that are already
 prepared are skipped, so a later batch is incremental. Candidate races are
 timed in bounded batches; the running best candidate is carried into every
 later batch so each candidate is compared head to head with it.
+Completed batches checkpoint their measurements and champion before releasing
+trials. Restarts resume the same race and tuning shard from that checkpoint.
 """
 
 from __future__ import annotations
@@ -20,6 +22,8 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
+from filelock import Timeout
+
 from b12x._lib.compile_plan import (
     compiled_program_available,
     observe_programs,
@@ -33,7 +37,9 @@ from b12x._lib.runtime_control import (
 )
 from ._cache import SelectionCache, cache_identity, digest
 from ._efficiency import AutotuneEffort, capture_autotune_effort
+from ._discovery import discovery_key, discovery_record, restore_discovery
 from ._measurement import DEFAULT_SAMPLES, SURVIVOR_ROUNDS
+from ._race_cache import RaceCache, RaceCheckpoint
 from ._timing import PreparationTiming
 from .device import DetectedDevice, detect_device
 from .types import (
@@ -82,6 +88,7 @@ class _Obligation:
     candidate_program_identity: str | None = None
     programs: dict = field(default_factory=dict)
     compiled: dict = field(default_factory=dict)
+    jobs: dict = field(default_factory=dict)
     compile_assignments: dict = field(default_factory=dict)
     cache_pending: bool = False
     ready: bool = False
@@ -398,6 +405,7 @@ class PreparationSession:
         )
         self.cache_dir = None if cache_dir is None else Path(cache_dir)
         self._cache = None
+        self._race_cache = None
         self._stop = threading.Event()
         if os.environ.get("B12X_AUTOTUNE", "1") == "0":
             self._stop.set()
@@ -466,6 +474,12 @@ class PreparationSession:
                 root, cache_identity(self.namespace.to_dict(), self.device.ordinal)
             )
         return self._cache
+
+    def _race_progress_cache(self):
+        if self._race_cache is None:
+            path = self._selection_cache().path.with_suffix(".progress.sqlite3")
+            self._race_cache = RaceCache(path)
+        return self._race_cache
 
     def _gpu_scope(self):
         """Return the CUDA device context for preparation operations."""
@@ -768,6 +782,9 @@ class PreparationSession:
         if self._guard is not None:
             guard, self._guard = self._guard, None
             closers.append(lambda: guard.__exit__(None, None, None))
+        if self._race_cache is not None:
+            cache, self._race_cache = self._race_cache, None
+            closers.append(cache.close)
         self.state = "CLOSED"
         try:
             _close_all(((self._synchronize,) if synchronize else ()) + tuple(closers))
@@ -805,6 +822,7 @@ class PreparationJob:
         self._new_plans = []
         self._benchmark_closers = []
         self._cache_hits = self._benchmarked = self._overlaps = 0
+        self._restored = self._rejected = 0
         self._all_programs = set()
         self._dependency_programs = {}
         self._coverage = {}
@@ -898,6 +916,8 @@ class PreparationJob:
             ready_cache=ready_cache,
             planned_requests=self._planned_requests,
             candidates_described=self._candidates_described,
+            restored_candidates=self._restored,
+            rejected_candidates=self._rejected,
         )
 
     def _collective_barrier(self, requirement: CollectiveRequirement) -> None:
@@ -1427,6 +1447,64 @@ class PreparationJob:
             ) = cached
             self._candidates_described = len(obligation.candidates)
             return
+        candidates = []
+        for assignment, config in obligation.candidates:
+            if self._warmup_only:
+                return
+            payload = contract.config_payload(config)
+            jobs = tuple(plan._compile_jobs(config, self.session.device))
+            obligation.jobs[payload] = jobs
+            candidates.append((assignment, payload, jobs))
+            if len(candidates) % 32 == 0:
+                yield "metadata"
+        with self._timing.span("discovery_key"):
+            key = discovery_key(candidates, self.session.device)
+        cache = self.session._race_progress_cache() if key is not None else None
+        lock = None
+        try:
+            record = cache.load_discovery(key) if cache is not None else None
+            if cache is not None and record is None:
+                lock = cache.discovery_lock(key)
+                while True:
+                    if self._warmup_only:
+                        return
+                    try:
+                        lock.acquire(timeout=0)
+                        break
+                    except Timeout:
+                        yield "compile"
+                record = cache.load_discovery(key)
+            if record is not None:
+                (
+                    obligation.candidate_program_identity,
+                    obligation.compiled,
+                    obligation.programs,
+                ) = restore_discovery(candidates, record)
+                self._candidates_described = len(candidates)
+            else:
+                yield from self._discover_candidates(obligation)
+                if obligation.candidate_program_identity is None:
+                    return
+                if cache is not None:
+                    cache.save_discovery(
+                        key,
+                        discovery_record(
+                            candidates,
+                            obligation.compiled,
+                            obligation.candidate_program_identity,
+                        ),
+                    )
+        finally:
+            if lock is not None:
+                lock.release()
+        self._described_candidates[declaration] = (
+            obligation.candidate_program_identity,
+            obligation.compiled,
+            obligation.programs,
+        )
+
+    def _discover_candidates(self, obligation):
+        contract = obligation.request.plan.contract
         if self.session.compile_workers and self.session.device.ordinal is not None:
             batch_size = 32 * self.session.compile_workers
             for start in range(0, len(obligation.candidates), batch_size):
@@ -1435,9 +1513,7 @@ class PreparationJob:
                 jobs, configs = [], []
                 for _, config in obligation.candidates[start : start + batch_size]:
                     payload = contract.config_payload(config)
-                    candidate_jobs = tuple(
-                        plan._compile_jobs(config, self.session.device)
-                    )
+                    candidate_jobs = obligation.jobs[payload]
                     configs.append((payload, len(candidate_jobs)))
                     jobs.extend(candidate_jobs)
                 if jobs:
@@ -1478,18 +1554,17 @@ class PreparationJob:
                 self._candidates_described, len(identities)
             )
         obligation.candidate_program_identity = digest(identities)
-        self._described_candidates[declaration] = (
-            obligation.candidate_program_identity,
-            obligation.compiled,
-            obligation.programs,
-        )
 
     def _describe_programs(self, obligation, config):
         contract, plan = obligation.request.plan.contract, obligation.request.plan
         payload = contract.config_payload(config)
         if payload not in obligation.compiled:
             compiled = []
-            for job in plan._compile_jobs(config, self.session.device):
+            if payload not in obligation.jobs:
+                obligation.jobs[payload] = tuple(
+                    plan._compile_jobs(config, self.session.device)
+                )
+            for job in obligation.jobs[payload]:
                 if self._warmup_only:
                     return frozenset()
                 key = pickle.dumps(job, protocol=5)
@@ -1771,12 +1846,35 @@ class PreparationJob:
             raise ValueError(
                 f"multi-candidate preparation requires a representative benchmark: {request.name}"
             )
+        cache = checkpoint = checkpoint_key = None
+        if obligation.key is not None:
+            cache = self.session._race_progress_cache()
+            checkpoint_key = digest(
+                {
+                    "race": obligation.key,
+                    "shard_index": rank_index,
+                    "shard_count": rank_count,
+                    "rounds": self.session.rounds,
+                    "samples": self.session.samples,
+                }
+            )
+            checkpoint = cache.load(checkpoint_key)
+        measurements = {} if checkpoint is None else dict(checkpoint.measurements)
+        if not set(measurements).issubset(index for index, _ in local_candidates):
+            raise ValueError("race checkpoint contains candidates outside its shard")
+        self._restored += len(measurements)
+        self._candidates_prepared = len(measurements)
+        remaining = [item for item in local_candidates if item[0] not in measurements]
+        best_index = None if checkpoint is None else checkpoint.champion
+        compile_candidates = list(remaining)
+        if remaining and best_index is not None:
+            compile_candidates.append((best_index, obligation.candidates[best_index]))
         required_programs = ()
-        if rank_count == 1:
+        if rank_count == 1 and remaining:
             required_programs = yield from self._compile(
                 obligation, obligation.configuration.default, required=True
             )
-        for _, (assignment, config) in local_candidates:
+        for _, (assignment, config) in compile_candidates:
             if self.session._stop.is_set():
                 return None
             yield from self._compile(obligation, config, required=False)
@@ -1803,11 +1901,27 @@ class PreparationJob:
                 None,
             )
         budget = self.session._race_budget()
-        pending = list(local_candidates)
+        pending = remaining
         champion = carried = None
         live = []
         rejected_count = 0
         try:
+            if pending and best_index is not None:
+                assignment, config = obligation.candidates[best_index]
+                try:
+                    champion = yield from self._trial(
+                        obligation, best_index, assignment, config
+                    )
+                except _CandidateLaunchRejected:
+                    # A resource-dependent launch rejection can invalidate the
+                    # carried winner. Its eliminated competitors must race again.
+                    cache.delete(checkpoint_key)
+                    self._restored -= len(measurements)
+                    return (yield from self._race(obligation))
+                if champion is None:
+                    return None
+                live.append(champion)
+                self._candidates_prepared -= 1
             while pending or carried is not None:
                 if self.session._stop.is_set():
                     return None
@@ -1829,6 +1943,7 @@ class PreparationJob:
                         )
                     except _CandidateLaunchRejected as error:
                         rejected_count += 1
+                        self._rejected += 1
                         logger.warning(
                             "Skipping %s candidate %d on rank %d: %r: %s",
                             request.name,
@@ -1879,6 +1994,18 @@ class PreparationJob:
                         trials[position].index,
                     ),
                 )
+                best_index = trials[best].index
+                measurements.update(
+                    (trial.index, float(latency))
+                    for trial, latency in zip(
+                        trials, measurement.latencies_us, strict=True
+                    )
+                )
+                if cache is not None:
+                    with self._timing.span("race_checkpoint"):
+                        cache.save(
+                            checkpoint_key, RaceCheckpoint(measurements, best_index)
+                        )
                 self._benchmarked += len(batch)
                 self._overlaps += measurement.overlapped_samples
                 with self._timing.span("trial_release"):
@@ -1900,10 +2027,8 @@ class PreparationJob:
                     latencies_us=list(measurement.latencies_us),
                     winner=champion.index,
                 )
-            obligation.coverage["measured_count"] = (
-                len(local_candidates) - rejected_count
-            )
-            if champion is None:
+            obligation.coverage["measured_count"] = len(measurements)
+            if best_index is None:
                 if rank_count > 1:
                     return TuningRequirement(
                         obligation.key,
@@ -1918,8 +2043,8 @@ class PreparationJob:
                     f"all {rejected_count} candidates rejected with "
                     "CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE (720)"
                 )
-            assignment, config = champion.assignment, champion.config
-            candidate_index, latency_us = champion.index, champion.latency_us
+            assignment, config = obligation.candidates[best_index]
+            candidate_index, latency_us = best_index, measurements[best_index]
             if rank_count > 1:
                 return TuningRequirement(
                     obligation.key,
@@ -2333,6 +2458,8 @@ class PreparationJob:
             benchmark_closers=self._benchmark_closers,
             cache_hits=self._cache_hits,
             benchmarked_candidates=self._benchmarked,
+            restored_candidates=self._restored,
+            rejected_candidates=self._rejected,
             elapsed_seconds=time.monotonic() - self._started,
             compilation=summary,
             overlapped_benchmark_samples=self._overlaps,

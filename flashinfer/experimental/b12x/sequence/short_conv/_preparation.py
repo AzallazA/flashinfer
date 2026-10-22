@@ -622,7 +622,7 @@ def make_plan(caps, *, invocation=None, override=None):
             CompileJob.create(
                 "b12x.sequence.short_conv._preparation:compile_pipeline",
                 TUNING.encode_query(query),
-                detected.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

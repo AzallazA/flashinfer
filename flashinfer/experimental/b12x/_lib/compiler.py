@@ -89,12 +89,14 @@ class DimKey:
 
 @dataclass(frozen=True)
 class TensorKey:
+    """Tensor specialization metadata independent of physical device identity."""
+
     name: str
     dtype: str
     rank: int
     dims: tuple[DimKey, ...]
     stride: tuple[int, ...]
-    device: tuple[str, int | None]
+    device_type: str
     align: int | None = None
     layout: object = None
 
@@ -122,7 +124,7 @@ class TensorKey:
             rank=len(shape),
             dims=dims,
             stride=tuple(int(stride) for stride in tensor.stride()),
-            device=(device.type, device.index),
+            device_type=device.type,
             align=align,
             layout=layout,
         )
@@ -434,7 +436,7 @@ def tensor_compile_fact(
         len(shape),
         dim_facts,
         stride_facts,
-        (str(device.type), device.index),
+        str(device.type),
         None if align is None else int(align),
         layout_fact,
     )
@@ -561,6 +563,8 @@ def _compile_kwargs_json_key(kwargs: dict[str, Any]) -> tuple[str, str]:
 def _compile_spec_shape_key(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if type(value).__module__ == "torch" and type(value).__name__ == "device":
+        return ("device", value.type)
     if isinstance(value, bytes):
         return ("bytes", value)
     if isinstance(value, Path):
@@ -575,7 +579,7 @@ def _compile_spec_shape_key(value: Any) -> Any:
             value.rank,
             tuple(_compile_spec_shape_key(dim) for dim in value.dims),
             value.stride,
-            value.device,
+            value.device_type,
             value.align,
             _compile_spec_shape_key(value.layout),
         )
@@ -1677,6 +1681,8 @@ def _structural_cache_key(value: Any, visited: set[int] | None = None) -> Any:
 
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if type(value).__module__ == "torch" and type(value).__name__ == "device":
+        return ("device", value.type)
     if isinstance(value, bytes):
         return ("bytes", value.hex())
     if isinstance(value, Path):

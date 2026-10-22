@@ -67,7 +67,7 @@ def plan(query: BmmQuery, *, invocation=FrozenMapping(), override=None) -> Plan:
             CompileJob.create(
                 "b12x.gemm._bmm._preparation:compile_bmm",
                 TUNING.encode_query(query),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

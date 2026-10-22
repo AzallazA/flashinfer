@@ -73,7 +73,7 @@ def compile_scale(ordinal):
             compile_spec=KernelCompileSpec.from_key(
                 "attention.compressed_sparse_mla.index_weights",
                 1,
-                (ordinal,),
+                (),
             ),
         )
 
@@ -117,7 +117,7 @@ def plan(query: Query, *, device, invocation=FrozenMapping(), override=None) -> 
         return (
             CompileJob.create(
                 "b12x.attention.compressed_sparse_mla.weight_scale:compile_scale",
-                detected.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

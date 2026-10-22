@@ -335,7 +335,7 @@ def plan(
             CompileJob.create(
                 "b12x.comm.pcie._owner_preparation:compile_owner_surface",
                 TUNING.encode_query(query),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         ),
         _memory_requirements=memory,

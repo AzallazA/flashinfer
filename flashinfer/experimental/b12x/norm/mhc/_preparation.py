@@ -725,7 +725,7 @@ def plan_mhc(caps, *, invocation=FrozenMapping(), override=None):
                 TUNING.encode_query(query),
                 config.to_dict(),
                 asdict(native(config, device)),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         ),
         _memory_requirements=memory,

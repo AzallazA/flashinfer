@@ -123,7 +123,7 @@ class _Vision:
 
 @cache
 def _compile(operation, width, heads, ratio, device):
-    key = (operation, width, heads, ratio, device)
+    key = (operation, width, heads, ratio)
     entry = _Vision(operation, width, heads, ratio)
     raise_if_kernel_resolution_frozen("cute.compile", target=entry, cache_key=key)
     types = (BFloat16, BFloat16, BFloat16, BFloat16, Float32, Int32)

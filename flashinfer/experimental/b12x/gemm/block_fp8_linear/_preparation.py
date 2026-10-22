@@ -258,7 +258,7 @@ def plan(
                 "b12x.gemm.block_fp8_linear._preparation:compile_block_fp8",
                 compile_query,
                 TUNING.encode_config(config),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
                 device.identity.sm_count,
             ),
         )

@@ -117,7 +117,7 @@ def plan(query: MambaQuery, *, device, invocation=FrozenMapping(), override=None
                 "b12x.sequence.mamba_ssd._preparation:compile_pipeline",
                 TUNING.encode_query(query),
                 TUNING.encode_config(config),
-                detected.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 

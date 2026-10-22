@@ -811,11 +811,6 @@ def _fake_pointer(dtype: torch.dtype = torch.bfloat16) -> cute.Pointer:
     )
 
 
-def _device_index(tensor: torch.Tensor) -> int:
-    index = tensor.device.index
-    return torch.cuda.current_device() if index is None else int(index)
-
-
 def _compile(
     key: tuple[object, ...],
     entry: object,
@@ -827,8 +822,9 @@ def _compile(
     runtime_int64s: int = 0,
     pointer_dtypes: tuple[torch.dtype, ...] = (),
 ) -> Callable[..., None]:
+    cache_key = (device, key)
     with _LOCK:
-        cached = _CACHE.get(key)
+        cached = _CACHE.get(cache_key)
         if cached is not None:
             return cached
         with torch.cuda.device(device):
@@ -855,7 +851,7 @@ def _compile(
                     key,
                 ),
             )
-        _CACHE[key] = compiled
+        _CACHE[cache_key] = compiled
         return compiled
 
 
@@ -869,11 +865,12 @@ def _run(
     runtime_int64s: tuple[int, ...] = (),
 ) -> None:
     device = tensors[0].device
+    cache_key = (device, key)
     with torch.cuda.device(device):
         capturing = torch.cuda.is_current_stream_capturing()
         with _LOCK:
-            compiled = _CACHE.get(key)
-            warmed = compiled is not None and _WARMED.get(key) is compiled
+            compiled = _CACHE.get(cache_key)
+            warmed = compiled is not None and _WARMED.get(cache_key) is compiled
         if capturing and not warmed:
             raise RuntimeError(
                 "HyperConnection CuTe kernels must be compiled and warm-run "
@@ -899,8 +896,8 @@ def _run(
         run_compiled(compiled, tuple(args))
     if not capturing:
         with _LOCK:
-            if _CACHE.get(key) is compiled:
-                _WARMED[key] = compiled
+            if _CACHE.get(cache_key) is compiled:
+                _WARMED[cache_key] = compiled
 
 
 def grouped_rmsnorm(
@@ -916,7 +913,6 @@ def grouped_rmsnorm(
     rows = int(state.shape[0]) * int(streams)
     key = (
         "norm" if zero_centered else "rmsnorm",
-        _device_index(state),
         int(streams),
         int(hidden_size),
     )
@@ -940,7 +936,7 @@ def scaled_silu(
 ) -> None:
     elements = int(projected.numel())
     lowrank = int(projected.shape[1])
-    key = ("silu", _device_index(projected), int(streams), lowrank)
+    key = ("silu", int(streams), lowrank)
     _run(
         key,
         _ScaledSilu(streams, lowrank),
@@ -959,7 +955,7 @@ def gate_mean(
     hidden_size: int,
 ) -> None:
     tokens = int(normalized.shape[0])
-    key = ("gate", _device_index(normalized), int(streams), int(hidden_size))
+    key = ("gate", int(streams), int(hidden_size))
     _run(
         key,
         _GateMean(streams, hidden_size),
@@ -978,7 +974,7 @@ def combine(
     hidden_size: int,
 ) -> None:
     tokens = int(state.shape[0])
-    key = ("combine", _device_index(state), int(streams), int(hidden_size))
+    key = ("combine", int(streams), int(hidden_size))
     _run(
         key,
         _Combine(streams, hidden_size),
@@ -1005,7 +1001,6 @@ def combine_norm(
     packed = int(hidden_size) % _PackedCombineNorm._PACK_ELEMENTS == 0
     key = (
         "combine_norm_packed" if packed else "combine_norm",
-        _device_index(state),
         int(streams),
         int(hidden_size),
         str(weight.dtype),
@@ -1042,7 +1037,6 @@ def engram_mix(
 ) -> None:
     key = (
         "engram_mix",
-        _device_index(state),
         int(streams),
         int(hidden_size),
         token_mask is not None,
@@ -1074,7 +1068,6 @@ def pointwise(
 ) -> None:
     key = (
         operation,
-        _device_index(left),
         str(left.dtype),
         str(right.dtype),
         str(output.dtype),

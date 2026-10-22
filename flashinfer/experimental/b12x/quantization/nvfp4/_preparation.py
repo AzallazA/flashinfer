@@ -52,7 +52,7 @@ def plan(
                 "b12x.quantization.nvfp4._preparation:compile_quantizer",
                 TUNING.encode_query(query),
                 config.to_dict(),
-                device.ordinal,
+                CompileJob.DEVICE_ORDINAL,
             ),
         )
 
