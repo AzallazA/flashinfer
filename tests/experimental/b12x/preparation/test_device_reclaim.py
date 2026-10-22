@@ -1,6 +1,7 @@
 """A finished preparation reclaims the device memory its losing candidates used."""
 
 import weakref
+from dataclasses import replace
 
 import pytest
 
@@ -8,7 +9,49 @@ from b12x._lib import program_cache
 from b12x.preparation import PreparedCall
 from ..conftest import require_b12x
 from .test_defaults import contract
-from .test_session import _deterministic_timer, request, session
+from .test_session import _deterministic_timer, declaration, request, session
+
+
+def test_race_releases_factory_results_between_batches(tmp_path, monkeypatch):
+    references = {}
+
+    class State:
+        def __init__(self, width):
+            self.value = width * 3
+            self.cycle = self
+
+    @program_cache.program_cache(scope="preparation")
+    def factory(width):
+        if width == 4:
+            assert references[1]() is None
+            assert references[2]() is not None
+        value = State(width)
+        references[width] = weakref.ref(value)
+        return value
+
+    plan = replace(
+        declaration(tuning=contract(values=(1, 2, 4, 8))),
+        _materialize=lambda selection, device: factory(selection.config.width),
+    )
+    item = plan.request(
+        name="bounded",
+        prepare_call=lambda state: PreparedCall(run=lambda: state.value),
+        benchmark_call=lambda state: PreparedCall(
+            run=lambda: state.value, produce=lambda: None
+        ),
+    )
+    with session(tmp_path, race_batch=2) as engine:
+        job = engine.begin((item,))
+
+        def check_cleanup_ownership():
+            assert not job._temporaries
+
+        _deterministic_timer(monkeypatch, stop=check_cleanup_ownership)
+        while not job.advance().done:
+            pass
+        assert job.result().selections["bounded"].config.width == 2
+        assert plan.prepared.state.value == 6
+        assert [width for width, ref in references.items() if ref() is not None] == [2]
 
 
 def test_race_reclaims_device_memory_once_after_every_trial_closes(

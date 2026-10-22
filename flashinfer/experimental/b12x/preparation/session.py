@@ -1680,6 +1680,7 @@ class PreparationJob:
             resident = max(0, self.session._allocated() - before)
         self._candidates_prepared += 1
         yield "gpu"
+        self._temporaries.remove(guard.finish)
         return _Trial(index, assignment, config, call, guard, retained, state, resident)
 
     def _observe(self, race):
@@ -1887,6 +1888,10 @@ class PreparationJob:
                             live.remove(trial)
                 champion = trials[best]
                 champion.latency_us = float(measurement.latencies_us[best])
+                with self._timing.span("trial_reclamation"):
+                    self._program_cache.clear()
+                    evict_unretained(())
+                    gc.collect()
                 self._timing.record(
                     "batch_end",
                     request=request.name,
