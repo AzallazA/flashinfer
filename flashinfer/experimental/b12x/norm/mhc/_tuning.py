@@ -312,6 +312,8 @@ def _validate(
         raise ValueError("projection_tile_m must equal 16 * projection_num_m_warps")
     if config.projection_tile_n <= 0 or config.projection_tile_n % 8:
         raise ValueError("projection_tile_n must be a positive multiple of 8")
+    if config.projection_tile_n == 48:
+        raise ValueError("TF32 TMA shared-memory layout cannot slice tile_n=48")
     n_mma_tiles = config.projection_tile_n // 8
     if n_mma_tiles % config.projection_num_n_warps:
         raise ValueError("projection_num_n_warps must divide projection_tile_n / 8")
@@ -535,6 +537,8 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
         predicates=(
             # TMA alignment, complete MMA tiles, CTA limits and scratch bounds.
             lambda p: p["backend"] != "tf32_tma" or p["projection_tile_k"] >= 32,
+            # CuTe aborts when slicing the FP32 swizzled layout with 48 rows.
+            lambda p: p["backend"] != "tf32_tma" or p["projection_tile_n"] != 48,
             lambda p: (
                 p["backend"] != "tf32_tma"
                 or (p["projection_num_m_warps"] * p["projection_num_n_warps"] + 1) * 32
@@ -608,7 +612,7 @@ TUNING = TuningContract(
     default_config=_default_config,
     validate_query=_validate_query,
     validate_config=_validate,
-    candidate_contract_version=14,
+    candidate_contract_version=15,
     knobs=(
         Knob(
             name="backend",

@@ -2682,6 +2682,8 @@ class MHCPrefillTf32ProjectTmaKernel:
                 f"TF32 TMA tile_n={self.tile_n} must be a positive multiple of 8 "
                 "for m16n8k8 warp MMA"
             )
+        if self.tile_n == 48:
+            raise ValueError("TF32 TMA shared-memory layout cannot slice tile_n=48")
         if self.num_n_warps <= 0 or (self.tile_n // 8) % self.num_n_warps != 0:
             raise ValueError(
                 f"TF32 TMA N warps={self.num_n_warps} must divide "

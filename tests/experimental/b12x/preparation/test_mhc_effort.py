@@ -87,6 +87,86 @@ def test_effort_preserves_hard_constraints(effort):
         _tuning.TUNING.parameter_space(q, None).validate(assignment(config))
 
 
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "max"])
+def test_unsliceable_projection_layout_is_always_illegal(effort):
+    q = query(tokens=4096, effort=effort)
+    config = replace(_tuning.TUNING.default_config(q, None), projection_tile_n=48)
+    with pytest.raises(ValueError, match="correctness predicates"):
+        _tuning.TUNING.parameter_space(q, None).validate(assignment(config))
+    with pytest.raises(ValueError, match="cannot slice tile_n=48"):
+        _tuning.TUNING.validate_config(q, config, None)
+
+
+def test_projection_constructor_rejects_unsliceable_layout():
+    from b12x.norm.mhc._kernels import MHCPrefillTf32ProjectTmaKernel
+
+    with pytest.raises(ValueError, match="cannot slice tile_n=48"):
+        MHCPrefillTf32ProjectTmaKernel(
+            hidden_size=5120,
+            tile_m=16,
+            tile_n=48,
+            tile_k=32,
+            num_stages=1,
+            num_m_warps=1,
+            num_n_warps=1,
+            k_splits=2,
+        )
+
+
+def test_worker_compiles_legal_mhc_projection_tiles():
+    from .test_compile_pool_fake_indexing import _run_offline_worker
+
+    _run_offline_worker(
+        """
+        from dataclasses import replace
+        from tempfile import TemporaryDirectory
+        import os
+        from b12x.norm import mhc
+        from b12x.preparation import autotune_effort
+        from b12x.preparation.device import detect_device
+        from b12x._lib.compile_plan import compiled_program_available
+        from b12x._lib.compile_pool import CompilePool
+
+        compile_pool._initialize_worker(
+            0, (12, 0), "synthetic", "RTX PRO 6000", 188, 101376, 102400,
+            multiprocessing.get_context("spawn").Array("q", (0, 0)),
+        )
+        device = detect_device("cuda:0")
+        jobs = []
+        for operation in ("pre", "post_pre"):
+            with autotune_effort("max"):
+                plan = mhc.plan(
+                    mhc.Caps(device="cuda:0", max_tokens=4096, hidden_size=5120),
+                    invocation=dict(operation=operation, has_norm_weight=True,
+                                    lagged_mix=True, expanded_residual=operation == "pre",
+                                    rms_eps=1e-20, hc_eps=1e-6, norm_eps=1e-20,
+                                    sinkhorn_iters=20),
+                )
+            default = plan.contract.default_config(plan.query, device.identity)
+            for tile_n in (24, 32, 64):
+                config = replace(default, projection_tile_m=16,
+                                 projection_num_m_warps=1, projection_num_n_warps=1,
+                                 projection_tile_n=tile_n, projection_tile_k=32,
+                                 projection_num_stages=1, projection_k_splits=2)
+                plan.contract.validate_config(plan.query, config, device.identity)
+                jobs.extend(plan._compile_jobs(config, device))
+        with TemporaryDirectory() as cache:
+            os.environ["B12X_COMPILE_CACHE_DIR"] = cache
+            with CompilePool(device_ordinal=0, compute_capability=(12, 0),
+                             device_uuid="synthetic", product_name="RTX PRO 6000",
+                             sm_count=188, max_shared_memory_per_block=101376,
+                             max_shared_memory_per_multiprocessor=102400,
+                             workers=1) as engine:
+                descriptions = engine.plan(jobs)
+                programs = engine.submit_plans(descriptions)
+                engine.wait(programs)
+                assert all(compiled_program_available(p) for p in programs)
+                assert engine.summary().cute_compilations > 0
+        assert not torch.cuda.is_initialized()
+        """
+    )
+
+
 def test_effort_captured_and_removed_from_compile_cache_key(monkeypatch):
     from b12x.norm import mhc
 
@@ -132,7 +212,7 @@ def test_explicit_effort_overrides_legacy_exhaustive():
 
 def test_max_explores_padding_while_retaining_resource_limits():
     q = query(tokens=4096, effort="high")
-    config = replace(_tuning.TUNING.default_config(q, None), projection_tile_n=48)
+    config = replace(_tuning.TUNING.default_config(q, None), projection_tile_n=64)
     with pytest.raises(ValueError, match="efficiency predicates"):
         _tuning.TUNING.parameter_space(q, None).validate(assignment(config))
     exhaustive = query(tokens=4096, effort="max")
