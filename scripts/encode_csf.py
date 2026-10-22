@@ -132,7 +132,13 @@ def _header(path):
 def _array(mapping, origin, info):
     return np.ndarray(
         info["shape"],
-        dtype={"U8": "u1", "U16": "<u2", "U32": "<u4", "F8_E4M3": "u1"}[info["dtype"]],
+        dtype={
+            "U8": "u1",
+            "U16": "<u2",
+            "U32": "<u4",
+            "F8_E4M3": "u1",
+            "F8_E8M0": "u1",
+        }[info["dtype"]],
         buffer=mapping,
         offset=origin + info["data_offsets"][0],
     )
@@ -288,7 +294,7 @@ def convert(source, output, *, quantization, workers=4, scale_pattern=SCALE_PATT
         weight = weights[0]
         if (
             scale["dtype"]
-            not in (("U8",) if quantization == "mxfp4" else ("U8", "F8_E4M3"))
+            not in (("U8", "F8_E8M0") if quantization == "mxfp4" else ("U8", "F8_E4M3"))
             or weight["dtype"] not in ("U8", "I8")
             or len(weight["shape"]) != 2
             or weight["shape"][1] * 2 % group

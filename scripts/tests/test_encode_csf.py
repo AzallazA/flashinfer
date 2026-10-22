@@ -3,6 +3,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import struct
 import sys
 
 import numpy as np
@@ -92,7 +93,7 @@ def test_constant_rows_have_no_exceptions(quantization, value):
     )
 
 
-def checkpoint(tmp_path):
+def checkpoint(tmp_path, scale_dtype="U8"):
     source = tmp_path / "source"
     source.mkdir()
     rng = np.random.default_rng(91)
@@ -107,7 +108,18 @@ def checkpoint(tmp_path):
         "retained": np.array([1, -2, 3], dtype=np.float32),
         "empty": np.empty(0, dtype=np.uint16),
     }
-    save_file(tensors, source / "model.safetensors", metadata={"format": "pt"})
+    shard = source / "model.safetensors"
+    save_file(tensors, shard, metadata={"format": "pt"})
+    if scale_dtype != "U8":
+        contents = shard.read_bytes()
+        header_size = struct.unpack("<Q", contents[:8])[0]
+        header = json.loads(contents[8 : 8 + header_size])
+        header[scale_name]["dtype"] = scale_dtype
+        encoded = json.dumps(header).encode()
+        encoded += b" " * (-len(encoded) % 8)
+        shard.write_bytes(
+            struct.pack("<Q", len(encoded)) + encoded + contents[8 + header_size :]
+        )
     (source / "config.json").write_text(
         json.dumps(
             {
@@ -131,8 +143,9 @@ def checkpoint(tmp_path):
     return source, scale_name, tensors
 
 
-def test_checkpoint_writer_preserves_bytes_and_metadata(tmp_path):
-    source, scale_name, tensors = checkpoint(tmp_path)
+@pytest.mark.parametrize("scale_dtype", ["U8", "F8_E8M0"])
+def test_checkpoint_writer_preserves_bytes_and_metadata(tmp_path, scale_dtype):
+    source, scale_name, tensors = checkpoint(tmp_path, scale_dtype)
     output = tmp_path / "output"
     codec.convert(source, output, quantization="mxfp4", workers=1)
     index = json.loads((output / "model.safetensors.index.json").read_text())

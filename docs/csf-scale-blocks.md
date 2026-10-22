@@ -133,6 +133,8 @@ selection keys from direct-launch requests.
 
 `python scripts/encode_csf.py SOURCE OUTPUT --quantization mxfp4 --workers 8`
 encodes dense expert scale bytes directly, using only NumPy and safetensors.
+MXFP4 scales may use safetensors `U8` or `F8_E8M0` storage; both are read as
+UE8M0 bytes without numerical conversion.
 Use `--quantization nvfp4` for E4M3 scales. The encoder chooses each row's
 palette to minimize exceptions, breaking ties toward the smallest base.
 It selects expert `weight_scale` or `scale` tensors and checks their packed
