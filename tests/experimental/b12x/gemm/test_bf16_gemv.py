@@ -423,6 +423,59 @@ def test_prefill_projection_reuses_warm_kernel_and_preserves_live_graph_inputs(
 
 
 @cuda_required
+@pytest.mark.parametrize("n", [1, 2])
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+def test_prefill_confidence_projection_preserves_singleton_rows(
+    n, output_dtype, projection_session
+):
+    from b12x.gemm.bf16_gemv._prefill import prefill_mm
+    from b12x.gemm.bf16_gemv._tuning import GemvConfig
+
+    torch.manual_seed(415125)
+    capacity, k = 224, 5376
+    source = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16)
+    weight = (torch.randn(n, k, device="cuda") / k**0.5).bfloat16()
+    output = torch.empty(capacity, n, device="cuda", dtype=output_dtype)
+    plan = _prepare_projection(
+        projection_session,
+        source,
+        weight,
+        out=output,
+        override=GemvConfig(backend="prefill"),
+    )
+    prefill_mm(source, weight, output)
+    projection_session.freeze()
+    tolerance = 1e-6 if output_dtype == torch.float32 else 0.004
+    for rows in (1, 7, 63, capacity):
+        expected = source[:rows].double() @ weight.double().T
+        for prepared in (False, True):
+            output.fill_(float("nan"))
+            if prepared:
+                bf16_gemv.mm(source[:rows], weight, out=output[:rows], plan=plan)
+            else:
+                prefill_mm(source[:rows], weight, output[:rows])
+            torch.testing.assert_close(
+                output[:rows].double(), expected, rtol=tolerance, atol=tolerance
+            )
+            assert torch.isnan(output[rows:]).all()
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            bf16_gemv.mm(source, weight, out=output, plan=plan)
+        source.mul_(0.5)
+        weight.mul_(0.25)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = source.double() @ weight.double().T
+        torch.testing.assert_close(
+            output.double(), expected, rtol=tolerance, atol=tolerance
+        )
+    finally:
+        graph.reset()
+
+
+@cuda_required
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("m,n,k", [(257, 2048, 1024), (129, 1025, 513)])
 def test_broad_bf16_projection(output_dtype, m, n, k):

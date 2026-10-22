@@ -425,7 +425,11 @@ def prefill_mm(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> None
         return
     args = (
         _to_kernel_tensor(x, cutlass.BFloat16, dynamic_layout=True),
-        _to_kernel_tensor(weight, cutlass.BFloat16),
+        # A static singleton row collapses the swizzled TMA load to an invalid
+        # one-dimensional transfer. Keep its extent dynamic in the descriptor.
+        _to_kernel_tensor(
+            weight, cutlass.BFloat16, dynamic_layout=weight.shape[0] == 1
+        ),
         _to_kernel_tensor(
             out,
             cutlass.Float32 if out.dtype == torch.float32 else cutlass.BFloat16,
@@ -454,9 +458,12 @@ def prefill_mm(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> None
 
 
 def _prepared_args(x, weight, out):
+    # Match the eager descriptor's singleton-row handling during fake compilation.
     return (
         _to_kernel_tensor(x, cutlass.BFloat16, dynamic_layout=True),
-        _to_kernel_tensor(weight, cutlass.BFloat16),
+        _to_kernel_tensor(
+            weight, cutlass.BFloat16, dynamic_layout=weight.shape[0] == 1
+        ),
         _to_kernel_tensor(
             out,
             cutlass.Float32 if out.dtype == torch.float32 else cutlass.BFloat16,
