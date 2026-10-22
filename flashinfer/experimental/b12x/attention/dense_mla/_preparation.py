@@ -375,7 +375,7 @@ def compile_dense_mla(query_payload, config_payload, ordinal):
     query = DenseMlaQuery.from_dict(query_payload)
     config = DenseMlaConfig.from_config(FrozenMapping(config_payload))
     caps = _caps(query, config, torch.device("cuda", ordinal))
-    layout = _dense_mla_scratch_layout(caps)
+    layout = _dense_mla_scratch_layout(caps, num_splits=config.max_splits)
     abi = query.abi
     with FakeTensorMode(), compile_only_launches():
 
@@ -522,14 +522,16 @@ def plan(
     query = _query(caps, abi)
 
     def lowered(config):
-        return _caps(query, config, caps.device)
+        return replace(_caps(query, config, caps.device), budget=caps.budget)
 
     def memory(config, device):
-        native = plan_dense_mla_scratch(lowered(config))
+        native = plan_dense_mla_scratch(lowered(config), num_splits=config.max_splits)
         return MemoryRequirements(scratch=native.scratch_specs())
 
     def materialize(selection, device):
-        native = plan_dense_mla_scratch(lowered(selection.config))
+        native = plan_dense_mla_scratch(
+            lowered(selection.config), num_splits=selection.config.max_splits
+        )
         return _DenseMlaState(lowered(selection.config), native, query.abi)
 
     return Plan(
@@ -540,7 +542,9 @@ def plan(
         _compile_jobs=lambda config, device: (
             CompileJob.create(
                 "b12x.attention.dense_mla._preparation:compile_dense_mla",
-                TUNING.encode_query(replace(query, exhaustive=False)),
+                TUNING.encode_query(
+                    replace(query, exhaustive=False, autotune_effort="medium")
+                ),
                 TUNING.encode_config(config),
                 device.ordinal,
             ),

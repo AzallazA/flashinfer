@@ -29,8 +29,14 @@ def metadata_only(monkeypatch):
 
 def _caps(tokens=512, **kwargs):
     return gdn_prefill.Caps(
-        device="cuda:0", max_tokens=tokens, max_seqs=1, max_state_slots=46,
-        key_heads=16, value_heads=48, checkpoint_export=True, null_state_index=0,
+        device="cuda:0",
+        max_tokens=tokens,
+        max_seqs=1,
+        max_state_slots=46,
+        key_heads=16,
+        value_heads=48,
+        checkpoint_export=True,
+        null_state_index=0,
         **kwargs,
     )
 
@@ -48,7 +54,8 @@ def test_sequential_policy_keeps_every_legal_performance_choice(tokens, exhausti
     full = {config for _, config in _tuning.TUNING.choices(auto, DEVICE)}
     selected = {config for _, config in _tuning.TUNING.choices(restricted, DEVICE)}
     assert selected == {
-        config for config in full
+        config
+        for config in full
         if config.algorithm == "sequential" and config.k_split == 1
     }
     assert len({config.v_split for config in selected}) > 1
@@ -59,11 +66,15 @@ def test_sequential_policy_keeps_every_legal_performance_choice(tokens, exhausti
         exhaustive or tokens > 128
     )
     for config in selected:
-        layout = _impl._materialize_layout(_caps(tokens, recurrence_policy="sequential_k1"), config)
+        layout = _impl._materialize_layout(
+            _caps(tokens, recurrence_policy="sequential_k1"), config
+        )
         assert layout.parallel is None
         assert layout.k_split == 1
         assert (layout.v_split, layout.stages, layout.window_tiles) == (
-            config.v_split, config.stages, config.window_tiles,
+            config.v_split,
+            config.stages,
+            config.window_tiles,
         )
     assert not torch.cuda.is_initialized()
 
@@ -74,11 +85,15 @@ def test_default_policy_keeps_default_configuration(tokens):
     explicit = gdn_prefill.plan(_caps(tokens, recurrence_policy="auto"))
     restricted = gdn_prefill.plan(_caps(tokens, recurrence_policy="sequential_k1"))
     assert implicit.query == explicit.query
-    defaults = [_tuning.TUNING.configure(plan.query, device=DEVICE).default
-                for plan in (implicit, explicit, restricted)]
+    defaults = [
+        _tuning.TUNING.configure(plan.query, device=DEVICE).default
+        for plan in (implicit, explicit, restricted)
+    ]
     assert defaults[0] == defaults[1] == defaults[2]
     assert defaults[0] == _tuning.GdnPrefillConfig(
-        v_split=64, k_split=1, stages=3,
+        v_split=64,
+        k_split=1,
+        stages=3,
         window_tiles=_tuning.default_window_tiles(48, tokens, 1),
     )
 
@@ -88,10 +103,15 @@ def test_incompatible_overrides_and_assignments_rejected(exhaustive):
     query = _query(policy="sequential_k1", exhaustive=exhaustive)
     auto = replace(query, recurrence_policy="auto")
     candidates = tuple(_tuning.TUNING.choices(auto, DEVICE))
-    incompatible = [next(pair for pair in candidates if pair[1].k_split == 2),
-                    next(pair for pair in candidates if pair[1].algorithm == "chunk_parallel")]
+    incompatible = [
+        next(pair for pair in candidates if pair[1].k_split == 2),
+        next(pair for pair in candidates if pair[1].algorithm == "chunk_parallel"),
+    ]
     for assignment, config in incompatible:
-        assert _tuning.TUNING.configure(auto, device=DEVICE, override=config).pinned == config
+        assert (
+            _tuning.TUNING.configure(auto, device=DEVICE, override=config).pinned
+            == config
+        )
         with pytest.raises(ValueError, match="recurrence_policy"):
             _tuning.TUNING.configure(query, device=DEVICE, override=config)
         with pytest.raises(ValueError, match="correctness predicates"):
@@ -115,15 +135,19 @@ def test_policy_reaches_serialized_query_and_compiler_caps(policy):
 
 
 def test_policy_separates_coalescing_and_persisted_selection_keys():
-    plans = [gdn_prefill.plan(_caps(recurrence_policy=policy))
-             for policy in ("auto", "sequential_k1")]
+    plans = [
+        gdn_prefill.plan(_caps(recurrence_policy=policy))
+        for policy in ("auto", "sequential_k1")
+    ]
     assert _declaration_key(plans[0]) != _declaration_key(plans[1])
     job = object.__new__(PreparationJob)
     keys = []
     for plan in plans:
         configuration = _tuning.TUNING.configure(plan.query, device=DEVICE)
         request = plan.request(name="gdn", prepare_call=lambda state: None)
-        obligation = SimpleNamespace(request=request, configuration=configuration)
+        obligation = SimpleNamespace(
+            request=request, configuration=configuration, candidate_program_identity=()
+        )
         keys.append(job._choice_key(obligation, {}))
     assert keys[0] != keys[1]
 
@@ -133,19 +157,30 @@ def test_invalid_policy_rejected_at_caps_and_query(policy):
     with pytest.raises(ValueError, match="recurrence_policy"):
         _caps(recurrence_policy=policy)
     with pytest.raises(ValueError, match="recurrence_policy"):
-        _tuning.TUNING.configure(replace(_query(), recurrence_policy=policy), device=DEVICE)
+        _tuning.TUNING.configure(
+            replace(_query(), recurrence_policy=policy), device=DEVICE
+        )
 
 
 def test_kda_caps_and_query_contract_do_not_gain_gdn_policy():
-    caps = kda_prefill.Caps(device="cuda:0", max_tokens=512, max_seqs=1,
-        max_state_slots=46, heads=48, checkpoint_export=True, null_state_index=0)
+    caps = kda_prefill.Caps(
+        device="cuda:0",
+        max_tokens=512,
+        max_seqs=1,
+        max_state_slots=46,
+        heads=48,
+        checkpoint_export=True,
+        null_state_index=0,
+    )
     plan = kda_prefill.plan(caps)
     assert _caps_from_query(kda_impl, plan.query, 0, is_gdn=False) == caps
     assert "recurrence_policy" not in plan.query.to_dict()
     assert "recurrence_policy" not in kda_tuning.TUNING.encode_query(plan.query)
-    assert (kda_tuning.TUNING.query_schema_version,
-            kda_tuning.TUNING.config_schema_version,
-            kda_tuning.TUNING.candidate_contract_version) == (22, 22, 3)
+    assert (
+        kda_tuning.TUNING.query_schema_version,
+        kda_tuning.TUNING.config_schema_version,
+        kda_tuning.TUNING.candidate_contract_version,
+    ) == (22, 22, 3)
 
 
 @pytest.mark.parametrize("policy", ("auto", "sequential_k1"))
@@ -165,8 +200,10 @@ def test_fp32_precision_and_recurrence_policy_survive_compiler_roundtrip(policy)
 
 
 def test_precision_and_policy_have_independent_preparation_identities():
-    plans = [gdn_prefill.plan(_caps(intermediate_dtype=precision, recurrence_policy=policy))
-             for precision in (torch.bfloat16, torch.float32)
-             for policy in ("auto", "sequential_k1")]
+    plans = [
+        gdn_prefill.plan(_caps(intermediate_dtype=precision, recurrence_policy=policy))
+        for precision in (torch.bfloat16, torch.float32)
+        for policy in ("auto", "sequential_k1")
+    ]
     assert len({_declaration_key(plan) for plan in plans}) == 4
     assert _tuning.TUNING.query_schema_version == 24

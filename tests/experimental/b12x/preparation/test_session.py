@@ -118,6 +118,24 @@ def test_compiler_process_budget_can_be_limited_without_disabling_tuning(
         assert engine.compile_workers == 2
 
 
+@pytest.mark.parametrize("override", [None, True, False])
+def test_off_effort_prepares_heuristic_without_racing_or_cache(
+    tmp_path, monkeypatch, override
+):
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "off")
+    item = request(name="heuristic", tuning=contract(default=2, values=(1, 2, 4)))
+    with session(tmp_path, compile_workers=0) as engine:
+        assert not engine.autotune
+        monkeypatch.setattr(
+            engine,
+            "_selection_cache",
+            lambda: pytest.fail("off effort must not consult tuned selections"),
+        )
+        engine.prepare((item,), autotune=override)
+        assert item.plan.selection.config.width == 2
+        assert item.plan.selection.source == "default"
+
+
 @pytest.mark.parametrize(
     "identity, workers",
     [
@@ -1077,7 +1095,12 @@ def test_job_autotune_override_upgrades_live_default_and_reuses_winner(
     assert calls == [21, 6]
 
 
-def test_candidate_memory_envelope_covers_every_legal_config(tmp_path):
+@pytest.mark.parametrize("effort", ["off", "medium"])
+@pytest.mark.parametrize("autotune", [True, False])
+def test_candidate_memory_envelope_covers_eligible_configs(
+    tmp_path, monkeypatch, effort, autotune
+):
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", effort)
     tuning = contract(default=1, values=(256, 512, 1024))
     plan = Plan(
         contract=tuning,
@@ -1100,10 +1123,10 @@ def test_candidate_memory_envelope_covers_every_legal_config(tmp_path):
         prepare_call=lambda state: PreparedCall(run=lambda: None),
     )
 
-    with session(tmp_path) as engine:
+    with session(tmp_path, autotune=autotune) as engine:
         envelope = engine.candidate_memory_envelope((candidate,))
 
-    assert envelope.scratch[0].shape == (1024,)
+    assert envelope.scratch[0].shape == ((1,) if effort == "off" else (1024,))
     assert plan.scratch_specs()[0].shape == (1,)
 
 

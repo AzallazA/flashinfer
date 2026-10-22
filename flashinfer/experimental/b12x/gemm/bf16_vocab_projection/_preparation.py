@@ -16,12 +16,20 @@ from ._contracts import Caps, Binding, _bind
 from ._tuning import Bf16VocabProjectionConfig, Bf16VocabProjectionQuery, TUNING
 
 
+def _compile_query_payload(query):
+    return {
+        name: value
+        for name, value in TUNING.encode_query(query).items()
+        if name != "autotune_effort"
+    }
+
+
 @program_cache(scope="preparation")
 def compile_vocab_projection(query_payload, config_payload, ordinal):
     """Compile exactly the selected native vocabulary launcher."""
     from . import _kernel
 
-    query = Bf16VocabProjectionQuery(**dict(query_payload))
+    query = Bf16VocabProjectionQuery(**dict(query_payload), autotune_effort="medium")
     config = Bf16VocabProjectionConfig.from_config(FrozenMapping(config_payload))
     TUNING.validate_query(query, None)
     TUNING.validate_config(query, config, None)
@@ -78,7 +86,7 @@ def make_plan(caps: Caps, *, invocation=FrozenMapping(), override=None) -> Plan:
         return (
             CompileJob.create(
                 "b12x.gemm.bf16_vocab_projection._preparation:compile_vocab_projection",
-                TUNING.encode_query(query),
+                _compile_query_payload(query),
                 config.to_dict(),
                 device.ordinal,
             ),
@@ -90,7 +98,7 @@ def make_plan(caps: Caps, *, invocation=FrozenMapping(), override=None) -> Plan:
             runner = torch.nn.functional.linear
         else:
             programs = compile_vocab_projection(
-                TUNING.encode_query(query),
+                _compile_query_payload(query),
                 config.to_dict(),
                 device.ordinal,
             )

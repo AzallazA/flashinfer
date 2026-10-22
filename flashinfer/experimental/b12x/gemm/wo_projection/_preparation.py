@@ -96,6 +96,8 @@ def _fused_b_tile(query: WoProjectionQuery, config, device):
     override = query.codegen["wo_b_fused_tile"]
     if override:
         return tuple(map(int, override.split("x")))
+    if config.decode_tile_n:
+        return (16, config.decode_tile_n)
     if query.wo_b_tiled:
         from b12x._lib.dense_gemm.policy import _select_default_dense_gemm_plan
 
@@ -109,7 +111,17 @@ def _fused_b_tile(query: WoProjectionQuery, config, device):
         )
         tile = selected.mma_tiler_mn
         return tile if tile in ((16, 64), (16, 128)) else (16, 128)
-    return (16, config.decode_tile_n) if config.decode_tile_n else None
+    return None
+
+
+def _compile_query_payload(query: WoProjectionQuery):
+    return FrozenMapping(
+        {
+            name: value
+            for name, value in TUNING.encode_query(query).items()
+            if name != "autotune_effort"
+        }
+    )
 
 
 def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=None):
@@ -286,7 +298,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
                 if use_fused_b
                 else None
             ),
-            compile_wo_quantizers(TUNING.encode_query(query), device.ordinal),
+            compile_wo_quantizers(_compile_query_payload(query), device.ordinal),
         )
 
     return Plan(
@@ -318,7 +330,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
             ),
             CompileJob.create(
                 "b12x.gemm._shared.wo_mxfp8:compile_wo_quantizers",
-                TUNING.encode_query(query),
+                _compile_query_payload(query),
                 device.ordinal,
             ),
         ),

@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from b12x.preparation import (
     DeviceIdentity,
     FrozenMapping,
     Knob,
     ParameterBinding,
+    ParameterSpace,
     TuningContract,
+)
+from b12x.preparation._efficiency import (
+    AutotuneEffort,
+    EfficiencyPredicate,
+    capture_autotune_effort,
 )
 
 MAX_IN_FEATURES = 8_192
@@ -24,6 +30,12 @@ class Bf16VocabProjectionQuery:
     max_tokens: int
     in_features: int
     out_features: int
+    autotune_effort: str = field(default_factory=capture_autotune_effort)
+
+    def __post_init__(self):
+        object.__setattr__(
+            self, "autotune_effort", AutotuneEffort(self.autotune_effort).value
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -124,10 +136,8 @@ def _validate_config(
         return
     if config.backend != "triton":
         raise ValueError(f"unsupported projection backend {config.backend!r}")
-    if query.max_tokens != 1:
-        raise ValueError("the Triton vocabulary GEMV requires max_tokens=1")
-    if query.in_features > MAX_IN_FEATURES:
-        raise ValueError(f"the Triton vocabulary GEMV supports K <= {MAX_IN_FEATURES}")
+    if query.max_tokens > 65_535:
+        raise ValueError("the Triton token grid supports max_tokens <= 65535")
     if config.num_warps not in _TRITON_WARPS:
         raise ValueError(f"unsupported Triton warp count {config.num_warps}")
     if config.algorithm == "row":
@@ -150,17 +160,40 @@ def _tuning_parameters(query, device):
         for exponent in range(MAX_IN_FEATURES.bit_length())
         if 1 << exponent >= query.in_features
     )
-    return {
-        "backend": ("torch", "triton")
-        if query.max_tokens == 1 and query.in_features <= MAX_IN_FEATURES
-        else ("torch",),
-        "block_k": tuple(sorted(set(row_blocks) | _LOOP_BLOCKS)),
-    }
+    return ParameterSpace.create(
+        TUNING.knobs,
+        values={
+            "backend": ("torch", "triton")
+            if query.max_tokens <= 65_535
+            else ("torch",),
+            "block_k": tuple(sorted(set(row_blocks) | _LOOP_BLOCKS)),
+        },
+        efficiency_predicates=(
+            EfficiencyPredicate(
+                lambda choice: (
+                    choice["backend"] != "triton" or choice["num_warps"] in (4, 8)
+                ),
+                minimum_effort="medium",
+            ),
+            EfficiencyPredicate(
+                lambda choice: (
+                    choice["backend"] != "triton"
+                    or (query.max_tokens == 1 and query.in_features <= MAX_IN_FEATURES)
+                ),
+                minimum_effort="high",
+            ),
+            EfficiencyPredicate(
+                lambda choice: choice["backend"] != "triton" or query.max_tokens <= 8,
+                minimum_effort="max",
+            ),
+        ),
+        autotune_effort=query.autotune_effort,
+    )
 
 
 TUNING = TuningContract(
     component_id="gemm.bf16_vocab_projection",
-    query_schema_version=22,
+    query_schema_version=23,
     config_schema_version=22,
     query_fields=frozenset(Bf16VocabProjectionQuery.__dataclass_fields__),
     config_fields=frozenset(Bf16VocabProjectionConfig.__dataclass_fields__),
@@ -170,7 +203,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate_config,
     default_config=_default_config,
-    candidate_contract_version=2,
+    candidate_contract_version=3,
     knobs=(
         Knob(
             name="backend", values=("torch", "triton"), binding=ParameterBinding.COMPILE

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from b12x.preparation import (
     FrozenMapping,
@@ -10,6 +10,11 @@ from b12x.preparation import (
     ParameterBinding,
     ParameterSpace,
     TuningContract,
+)
+from b12x.preparation._efficiency import (
+    AutotuneEffort,
+    EfficiencyPredicate,
+    capture_autotune_effort,
 )
 
 
@@ -33,9 +38,13 @@ class WoProjectionQuery:
     sfb_k_replicated: bool = False
     wo_a_tiled: bool = False
     wo_b_tiled: bool = False
+    autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "codegen", FrozenMapping(self.codegen))
+        object.__setattr__(
+            self, "autotune_effort", AutotuneEffort(self.autotune_effort).value
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -49,9 +58,18 @@ def _decode_domain(query):
         not query.dynamic_tokens
         and query.dtype == "bfloat16"
         and 1 <= query.max_tokens <= 8
-        and (query.groups, query.group_width, query.rank, query.hidden)
-        == (2, 4096, 1024, 5120)
+        and query.groups * query.rank % 128 == 0
+        and (query.groups == 1 or query.rank % 32 == 0)
     )
+
+
+def _decode_tuning_geometry(query):
+    return _decode_domain(query) and (
+        query.groups,
+        query.group_width,
+        query.rank,
+        query.hidden,
+    ) == (2, 4096, 1024, 5120)
 
 
 def _validate_query(query, device):
@@ -111,14 +129,14 @@ def _validate(query, config, device):
     ):
         raise ValueError("WO decode_tile_n must be 0, 64 or 128")
     if config.decode_tile_n and not _decode_domain(query):
-        raise ValueError("WO decode tile requires BF16 2x4096/1024/5120 and M1..8")
+        raise ValueError("WO decode tile requires static BF16 M1..8 and aligned K/span")
     override = query.codegen.get("wo_b_fused_tile", "")
     if override and config.decode_tile_n not in (0, int(override.split("x")[1])):
         raise ValueError("WO decode tile conflicts with the captured tile control")
 
 
 def _default(query, device):
-    if not _decode_domain(query):
+    if not _decode_tuning_geometry(query):
         return WoProjectionConfig()
     override = query.codegen.get("wo_b_fused_tile", "")
     tile_n = (
@@ -131,18 +149,36 @@ def _default(query, device):
 
 def _parameters(query, device):
     override = query.codegen.get("wo_b_fused_tile", "")
-    tiles = (int(override.split("x")[1]),) if override else (64, 128)
+    tiles = (0, int(override.split("x")[1])) if override else (0, 64, 128)
+    preferred_n = (
+        int(override.split("x")[1])
+        if override
+        else (64 if query.max_tokens == 1 else 128)
+    )
     return ParameterSpace.create(
         TUNING.knobs,
         values={
             "decode_tile_n": tiles if _decode_domain(query) else (0,),
         },
+        efficiency_predicates=(
+            EfficiencyPredicate(
+                lambda choice: (
+                    choice["decode_tile_n"] == 0 or _decode_tuning_geometry(query)
+                ),
+                minimum_effort="medium",
+            ),
+            EfficiencyPredicate(
+                lambda choice: choice["decode_tile_n"] in (0, preferred_n),
+                minimum_effort="medium",
+            ),
+        ),
+        autotune_effort=query.autotune_effort,
     )
 
 
 TUNING = TuningContract(
     component_id="gemm.wo_projection",
-    query_schema_version=22,
+    query_schema_version=23,
     config_schema_version=22,
     query_fields=frozenset(WoProjectionQuery.__dataclass_fields__),
     config_fields=frozenset(WoProjectionConfig.__dataclass_fields__),
@@ -158,7 +194,7 @@ TUNING = TuningContract(
         Knob(name="backend", values=("mxfp8",), binding=ParameterBinding.COMPILE),
         Knob(name="decode_tile_n", values=None, binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=5,
+    candidate_contract_version=6,
     parameters=_parameters,
     materialize=lambda query, device, choice: WoProjectionConfig(**dict(choice)),
 )

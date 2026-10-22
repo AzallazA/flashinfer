@@ -363,6 +363,7 @@ def _select_default_dense_gemm_plan(
     block_fp8: bool = False,
     expected_m: Optional[int] = None,
     select_swapped_output_storage: bool = False,
+    allow_fp4_swap: bool = True,
 ) -> _DenseGemmPlan:
     tile = _select_default_mma_tiler_mn(
         m,
@@ -484,6 +485,8 @@ def _select_default_dense_gemm_plan(
         # benefits from doubling tile M: it halves the number of CTAs that
         # reload each weight/scaling block without starving the large-M grid.
         tile = (128, 128)
+    if not is_mxfp8 and not is_mxfp6 and not allow_fp4_swap and tile[1] < 64:
+        tile = (tile[0], 64)
     plan = _DenseGemmPlan(
         mma_tiler_mn=tile,
         load_path="tma",

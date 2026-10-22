@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cutlass
 import cutlass.cute as cute
@@ -175,9 +175,8 @@ _LAUNCH_ONLY_FIELDS = frozenset(("max_batch", "sm_count", "max_splits"))
 
 def _compile_key(query: PagedDecodeQuery, config: PagedDecodeConfig) -> tuple:
     fields = {**TUNING.encode_query(query), **config.to_dict()}
-    return tuple(
-        sorted((k, v) for k, v in fields.items() if k not in _LAUNCH_ONLY_FIELDS)
-    )
+    excluded = _LAUNCH_ONLY_FIELDS | {"exhaustive", "autotune_effort"}
+    return tuple(sorted((k, v) for k, v in fields.items() if k not in excluded))
 
 
 @program_cache(scope="preparation")
@@ -635,12 +634,15 @@ def make_plan(caps, *, invocation=None, override=None) -> Plan:
         sm_count=int(sm_count),
     )
     TUNING.validate_query(query, None)
+    compile_query = TUNING.encode_query(
+        replace(query, exhaustive=False, autotune_effort="medium")
+    )
 
     def compile_jobs(config, detected):
         return (
             CompileJob.create(
                 "b12x.attention.paged_decode._preparation:compile_paged_decode",
-                TUNING.encode_query(query),
+                compile_query,
                 config.to_dict(),
                 detected.ordinal,
             ),
@@ -656,7 +658,7 @@ def make_plan(caps, *, invocation=None, override=None) -> Plan:
         config = selection.config
         dev = torch.device("cuda", detected.ordinal)
         programs = compile_paged_decode(
-            TUNING.encode_query(query), config.to_dict(), detected.ordinal
+            compile_query, config.to_dict(), detected.ordinal
         )
         load_programs(programs)
         dummy_part = (

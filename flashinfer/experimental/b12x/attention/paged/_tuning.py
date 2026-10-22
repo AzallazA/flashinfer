@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
-from b12x.preparation._efficiency import capture_exhaustive_search, powers_of_two
+from b12x.preparation._efficiency import (
+    EfficiencyPredicate,
+    capture_autotune_effort,
+    capture_exhaustive_search,
+    powers_of_two,
+)
 
 from b12x.preparation import DeviceIdentity, FrozenMapping
 from b12x.preparation.tuning import (
@@ -82,6 +87,7 @@ class GqaQuery:
     abi: FrozenMapping
     controls: FrozenMapping
     exhaustive: bool = field(default_factory=capture_exhaustive_search)
+    autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -105,6 +111,7 @@ class GqaQuery:
             "abi": self.abi,
             "controls": self.controls,
             "exhaustive": self.exhaustive,
+            "autotune_effort": self.autotune_effort,
         }
 
 
@@ -220,6 +227,8 @@ class GqaConfig:
 def _heuristic(
     query: GqaQuery,
     _device: DeviceIdentity | None,
+    *,
+    apply_chunk_efficiency_policy: bool = True,
 ) -> GqaConfig:
     import torch
 
@@ -244,6 +253,7 @@ def _heuristic(
             max_work_items=query.requested_max_work_items,
             max_partial_rows=query.requested_max_partial_rows,
             force_split_kv=query.force_split_kv,
+            apply_chunk_efficiency_policy=apply_chunk_efficiency_policy,
         )
     return GqaConfig.from_capacity(capacity)
 
@@ -397,7 +407,15 @@ def _tuning_parameters(
             ),
         },
         exhaustive=query.exhaustive,
-        efficiency_predicates=(lambda p: p["graph_ctas_per_sm"] in residencies,),
+        autotune_effort=query.autotune_effort,
+        efficiency_predicates=(
+            EfficiencyPredicate(
+                lambda p: p["graph_ctas_per_sm"] in residencies, minimum_effort="high"
+            ),
+            EfficiencyPredicate(
+                lambda p: p["apply_chunk_efficiency_policy"], minimum_effort="high"
+            ),
+        ),
     )
 
 
@@ -420,7 +438,7 @@ def _materialize_tuning(
     ):
         raise ValueError("GQA tuning choice conflicts with requested split policy")
     # Only independent planner inputs are choices. Tile geometry, LUTs and
-    # workspace capacities remain derived by the unchanged production planner.
+    # workspace capacities remain derived from residency and caller bounds.
     return _heuristic(
         replace(
             query,
@@ -428,6 +446,7 @@ def _materialize_tuning(
             force_split_kv=choice["force_split_kv"],
         ),
         device,
+        apply_chunk_efficiency_policy=choice["apply_chunk_efficiency_policy"],
     )
 
 
@@ -436,7 +455,7 @@ TUNING = TuningContract(
     query_schema_version=22,
     config_schema_version=22,
     semantic_version=1,
-    candidate_contract_version=3,
+    candidate_contract_version=4,
     query_fields=frozenset(GqaQuery.__dataclass_fields__) - {"device"},
     config_fields=frozenset(GqaConfig.__dataclass_fields__),
     encode_query=GqaQuery.to_dict,
@@ -454,6 +473,11 @@ TUNING = TuningContract(
         Knob(
             name="force_split_kv",
             values=(False, True),
+            binding=ParameterBinding.COMPILE,
+        ),
+        Knob(
+            name="apply_chunk_efficiency_policy",
+            values=(True, False),
             binding=ParameterBinding.COMPILE,
         ),
     ),

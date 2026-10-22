@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 
 from b12x.preparation import (
     FrozenMapping,
@@ -10,6 +10,11 @@ from b12x.preparation import (
     ParameterBinding,
     ParameterSpace,
     TuningContract,
+)
+from b12x.preparation._efficiency import (
+    EfficiencyPredicate,
+    capture_autotune_effort,
+    capture_exhaustive_search,
 )
 
 from ._kernel import SMEM_LIMIT, default_max_splits
@@ -40,6 +45,8 @@ class PagedDecodeQuery:
     has_sinks: bool
     descale_layout: str
     sm_count: int
+    exhaustive: bool = field(default_factory=capture_exhaustive_search)
+    autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     @property
     def group_size(self) -> int:
@@ -201,13 +208,20 @@ def _validate_query(query, device):
 
 
 def _parameters(query, device):
-    # The best CTA geometry depends on the live context length, which a
-    # plan-time benchmark never sees (preparation runs short synthetic
-    # sequences, where more head slices always win while at long context each
-    # slice re-streams the whole KV range).  Offer only the measured default;
-    # explicit configs can still select any fitting head split.
     hs = default_config(query, device).head_splits
-    return ParameterSpace.create(TUNING.knobs, values={"head_splits": (hs,)})
+    # Short synthetic contexts favor head slices that reread KV at long context.
+    return ParameterSpace.create(
+        TUNING.knobs,
+        values={"head_splits": _head_split_choices(query)},
+        predicates=(lambda p: _rows_fit(query, p["head_splits"]),),
+        efficiency_predicates=(
+            EfficiencyPredicate(
+                lambda p: p["head_splits"] == hs, minimum_effort="high"
+            ),
+        ),
+        exhaustive=query.exhaustive,
+        autotune_effort=query.autotune_effort,
+    )
 
 
 def _materialize(query, device, choice):
@@ -217,7 +231,7 @@ def _materialize(query, device, choice):
 
 TUNING = TuningContract(
     component_id="attention.paged_decode",
-    query_schema_version=22,
+    query_schema_version=23,
     config_schema_version=22,
     query_fields=frozenset(field.name for field in fields(PagedDecodeQuery)),
     config_fields=frozenset(field.name for field in fields(PagedDecodeConfig)),
@@ -228,7 +242,7 @@ TUNING = TuningContract(
     validate_config=validate_config,
     default_config=default_config,
     knobs=(Knob(name="head_splits", values=None, binding=ParameterBinding.COMPILE),),
-    candidate_contract_version=1,
+    candidate_contract_version=2,
     parameters=_parameters,
     materialize=_materialize,
 )

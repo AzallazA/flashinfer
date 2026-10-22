@@ -79,10 +79,13 @@ from 16 rows per expert and retains its dense M64 crossover. These are untuned
 defaults; autotuning retains both supported scale choices, including compact
 N64 inline candidates. SM121 retains its device-specific defaults.
 
-M16/M32 inline candidates are omitted from autotuning when routed rows exceed
-the expert count times the tile height. Explicit overrides can still measure
-these kernels with larger batches. Compact MXFP4 W4A8 retains reconstructed
-K128 scale words across both K64 pipeline steps.
+M16/M32 inline candidates at routing densities above one tile per expert are
+searched at `B12X_AUTOTUNE_EFFORT=high` and `max`. Lower efforts omit them.
+Resident-grid caps use sparse power-of-two and fractional ladders below `max`;
+`max` searches every integer cap within the cooperative residency bound.
+`off` selects the heuristic configuration. Effort is captured in the tuning
+query and does not affect compiled program identities. Compact MXFP4 W4A8
+retains reconstructed K128 scale words across both K64 pipeline steps.
 
 Eligible compact N64 MXFP4 shards offer direct-route micro kernels through
 16 tokens and grouped M16 or M64 compute. M64 FC1 uses M32 arithmetic when a

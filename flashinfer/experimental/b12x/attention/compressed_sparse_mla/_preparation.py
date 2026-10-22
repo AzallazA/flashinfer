@@ -674,10 +674,12 @@ def plan(
         )
 
     def compile_jobs(config, device):
+        payload = TUNING.encode_query(query)
+        del payload["autotune_effort"]
         return (
             CompileJob.create(
                 "b12x.attention.compressed_sparse_mla._preparation:compile_compressed_sparse_mla",
-                TUNING.encode_query(query),
+                payload,
                 TUNING.encode_config(config),
                 device.ordinal,
             ),
@@ -690,8 +692,10 @@ def plan(
         # Resolve process-local executable owners only after the pool has made
         # their artifacts available.  The returned launch is the sole runtime
         # dispatcher; program keys are never used as an execution surrogate.
+        payload = TUNING.encode_query(query)
+        del payload["autotune_effort"]
         programs = compile_compressed_sparse_mla(
-            TUNING.encode_query(query),
+            payload,
             TUNING.encode_config(selection.config),
             device.ordinal,
         )

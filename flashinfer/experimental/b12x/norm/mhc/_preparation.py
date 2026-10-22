@@ -14,9 +14,11 @@ from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
 from b12x._lib.scratch import scratch_buffer_spec
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
+from b12x.preparation._efficiency import capture_autotune_effort
 from ._tuning import MhcConfig, MhcQuery, TUNING
 
 _CONTROL_NAMES = (
+    "B12X_AUTOTUNE_EFFORT",
     "B12X_AUTOTUNE_EXHAUSTIVE",
     "B12X_MHC_PREFILL_TF32_MMA",
     "B12X_MHC_PREFILL_BF16_MMA",
@@ -204,8 +206,16 @@ def compile_mhc(query_payload, config_payload, native_payload, ordinal):
         raise ValueError(
             "MHC compiler code-generation snapshot differs from declaration"
         )
+    compile_payload = query_payload.to_dict()
+    compile_payload["controls"] = FrozenMapping(
+        {
+            name: value
+            for name, value in query_payload["controls"].items()
+            if name not in ("B12X_AUTOTUNE_EFFORT", "B12X_AUTOTUNE_EXHAUSTIVE")
+        }
+    )
     return _compile_mhc(
-        query_payload,
+        FrozenMapping(compile_payload),
         FrozenMapping(config_payload),
         FrozenMapping(native_payload),
         ordinal,
@@ -602,7 +612,10 @@ def plan_mhc(caps, *, invocation=FrozenMapping(), override=None):
     if supplied:
         raise ValueError(f"unknown MHC invocation fields: {sorted(supplied)}")
     controls = FrozenMapping(
-        {name: os.environ[name] for name in _CONTROL_NAMES if name in os.environ}
+        {
+            **{name: os.environ[name] for name in _CONTROL_NAMES if name in os.environ},
+            "B12X_AUTOTUNE_EFFORT": capture_autotune_effort().value,
+        }
     )
     codegen = _codegen_snapshot()
     smem = (

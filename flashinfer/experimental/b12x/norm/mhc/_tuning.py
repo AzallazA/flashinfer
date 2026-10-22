@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass, replace
 
 from b12x.preparation import DeviceIdentity, FrozenMapping
+from b12x.preparation._efficiency import AutotuneEffort, EfficiencyPredicate
 from b12x.preparation.tuning import (
     Knob,
     ParameterBinding,
@@ -224,6 +225,17 @@ def _tf32_eligible(query):
 
 def _default_config(query, device):
     config = _projection_default_config(query, device)
+    if config.backend == "native":
+        config = _tf32_config(
+            backend="native",
+            tile_m=16,
+            tile_n=8,
+            tile_k=256,
+            num_stages=1,
+            num_m_warps=1,
+            num_n_warps=1,
+            k_splits=1,
+        )
     threshold = int(query.controls.get("B12X_MHC_PREFILL_MIN_TOKENS", "96"))
     prepared = query.lagged_mix and config.backend == "native"
     if query.operation == "pre":
@@ -332,7 +344,10 @@ def _tf32_pin(query):
 def _validate_query(query, device):
     if not isinstance(query, MhcQuery):
         raise TypeError("query must be MhcQuery")
-    if query.controls.get("B12X_AUTOTUNE_EXHAUSTIVE", "0") not in ("0", "1"):
+    _autotune_effort(query)
+    if "B12X_AUTOTUNE_EFFORT" not in query.controls and query.controls.get(
+        "B12X_AUTOTUNE_EXHAUSTIVE", "0"
+    ) not in ("0", "1"):
         raise ValueError("B12X_AUTOTUNE_EXHAUSTIVE must be 0 or 1")
     if query.operation not in ("pre", "post", "post_pre", "collapse"):
         raise ValueError("unknown mHC operation")
@@ -394,6 +409,17 @@ def _validate_query(query, device):
         raise ValueError("lagged MHC supports only pre and post_pre operations")
 
 
+def _autotune_effort(query: MhcQuery) -> AutotuneEffort:
+    value = query.controls.get("B12X_AUTOTUNE_EFFORT")
+    if value is not None:
+        return AutotuneEffort(value)
+    return (
+        AutotuneEffort.MAX
+        if query.controls.get("B12X_AUTOTUNE_EXHAUSTIVE", "0") == "1"
+        else AutotuneEffort.MEDIUM
+    )
+
+
 def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
     operation = query.operation
     total_k = _MHC_MULT * query.hidden_size
@@ -419,7 +445,9 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
         ),
     }
     if "tf32_tma" not in backends:
-        return ParameterSpace.create(TUNING.knobs, values=values)
+        return ParameterSpace.create(
+            TUNING.knobs, values=values, autotune_effort=_autotune_effort(query)
+        )
 
     from ._kernels import MHCPrefillTf32ProjectTmaKernel, _MIXES
 
@@ -451,7 +479,6 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
     m_warp_values = next(
         knob.values for knob in TUNING.knobs if knob.name == "projection_num_m_warps"
     )
-    min_grid = 1 if device is None else max(1, (device.sm_count + 7) // 8)
 
     def compact_m_grid(p):
         if p["backend"] != "tf32_tma":
@@ -463,15 +490,6 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
             and (query.max_tokens + 16 * smaller - 1) // (16 * smaller) == grid
             for smaller in m_warp_values
         )
-
-    def sufficient_grid(p):
-        if p["backend"] != "tf32_tma":
-            return True
-        tile_m = 16 * p["projection_num_m_warps"]
-        tile_n = p["projection_tile_n"]
-        return ((query.max_tokens + tile_m - 1) // tile_m) * (
-            (_MIXES + tile_n - 1) // tile_n
-        ) * p["projection_k_splits"] >= min_grid
 
     def bounded_split_grid(p):
         if (
@@ -493,14 +511,7 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
             return True
         m_warps = p["projection_num_m_warps"]
         return p["projection_num_n_warps"] == 1 and (
-            m_warps % 4 == 0 or (p["projection_tile_n"] == 8 and m_warps >= 2)
-        )
-
-    def prefill_column_tiles(p):
-        return (
-            p["backend"] != "tf32_tma"
-            or query.max_tokens < 2048
-            or p["projection_tile_n"] >= _MIXES
+            m_warps % 4 == 0 or p["projection_tile_n"] == 8
         )
 
     def prefill_pipeline(p):
@@ -520,7 +531,7 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
     return ParameterSpace.create(
         TUNING.knobs,
         values=values,
-        exhaustive=query.controls.get("B12X_AUTOTUNE_EXHAUSTIVE", "0") == "1",
+        autotune_effort=_autotune_effort(query),
         predicates=(
             # TMA alignment, complete MMA tiles, CTA limits and scratch bounds.
             lambda p: p["backend"] != "tf32_tma" or p["projection_tile_k"] >= 32,
@@ -555,15 +566,24 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
                 or p["projection_num_stages"]
                 <= total_k // (p["projection_tile_k"] * p["projection_k_splits"])
             ),
-            # Keep at least one eighth of an SM wave; splits and both tiles couple.
-            sufficient_grid,
-            # Beyond eight K splits, cap scheduling and reduction at four SM waves.
-            bounded_split_grid,
-            # Prefill couples the warp layout, column coverage and buffered K work.
-            prefill_warp_layout,
-            prefill_column_tiles,
-            prefill_pipeline,
-            prefill_split_work,
+            # Low effort keeps coarse projection tiles and modest split counts.
+            EfficiencyPredicate(
+                lambda p: (
+                    p["backend"] != "tf32_tma"
+                    or (
+                        p["projection_tile_k"] >= 64
+                        and p["projection_tile_n"] in (8, 24)
+                        and p["projection_num_n_warps"] == 1
+                        and p["projection_k_splits"] <= 8
+                    )
+                ),
+                minimum_effort="medium",
+            ),
+            # High effort explores scheduling, warp layout and pipeline tradeoffs.
+            EfficiencyPredicate(bounded_split_grid, minimum_effort="high"),
+            EfficiencyPredicate(prefill_warp_layout, minimum_effort="high"),
+            EfficiencyPredicate(prefill_pipeline, minimum_effort="high"),
+            EfficiencyPredicate(prefill_split_work, minimum_effort="high"),
         ),
     )
 
@@ -588,7 +608,7 @@ TUNING = TuningContract(
     default_config=_default_config,
     validate_query=_validate_query,
     validate_config=_validate,
-    candidate_contract_version=13,
+    candidate_contract_version=14,
     knobs=(
         Knob(
             name="backend",

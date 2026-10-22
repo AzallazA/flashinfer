@@ -87,7 +87,6 @@ def _choice(**changes):
             "projection_num_m_warps": 1,
             "projection_tile_n": 8,
         },
-        {"projection_k_splits": 1},
     ],
 )
 def test_mhc_efficiency_rules_and_explicit_pin(changes):
@@ -131,17 +130,14 @@ def test_mhc_exhaustive_preserves_correctness_rules(changes):
         TUNING.parameter_space(query, None).validate(_choice(**changes))
 
 
-def test_mhc_grid_floor_scales_with_device():
+def test_mhc_underoccupied_projection_remains_eligible():
     from b12x.norm.mhc._tuning import TUNING
 
     query = replace(_query(), max_tokens=1)
     choice = _choice(projection_num_m_warps=1, projection_k_splits=8)
-    TUNING.parameter_space(
-        query, DeviceIdentity("nvidia", (12, 1), 48, "GB10")
-    ).validate(choice)
-    with pytest.raises(ValueError, match="efficiency predicates"):
+    for capability, sm in (((12, 1), 48), ((12, 0), 188)):
         TUNING.parameter_space(
-            query, DeviceIdentity("nvidia", (12, 0), 188, "RTX PRO 6000")
+            query, DeviceIdentity("nvidia", capability, sm, "Blackwell")
         ).validate(choice)
 
 
@@ -189,7 +185,6 @@ def test_exhaustive_policy_does_not_change_compiled_program_identity(monkeypatch
     [
         (384, {"projection_num_m_warps": 1, "projection_num_n_warps": 3}),
         (384, {"projection_num_m_warps": 3}),
-        (2048, {"projection_tile_n": 8}),
         (384, {"projection_tile_k": 32}),
         (384, {"projection_tile_k": 128, "projection_num_stages": 3}),
         (2048, {"projection_k_splits": 16}),

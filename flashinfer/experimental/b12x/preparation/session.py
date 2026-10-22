@@ -31,6 +31,7 @@ from b12x._lib.runtime_control import (
     kernel_resolution_guard,
 )
 from ._cache import SelectionCache, cache_identity, digest
+from ._efficiency import AutotuneEffort, capture_autotune_effort
 from ._measurement import DEFAULT_SAMPLES, SURVIVOR_ROUNDS
 from ._timing import PreparationTiming
 from .device import DetectedDevice, detect_device
@@ -378,7 +379,9 @@ class PreparationSession:
             raise ValueError("race_budget must be a positive byte count or None")
         if type(autotune) is not bool or type(cache_only) is not bool:
             raise TypeError("autotune and cache_only must be boolean")
-        self.autotune, self.cache_only = autotune, cache_only
+        self._autotune_effort = capture_autotune_effort()
+        self.autotune = autotune and self._autotune_effort is not AutotuneEffort.OFF
+        self.cache_only = cache_only and self._autotune_effort is not AutotuneEffort.OFF
         self.compile_workers, self.rounds, self.samples = (
             compile_workers,
             rounds,
@@ -520,7 +523,8 @@ class PreparationSession:
         job = PreparationJob(
             self,
             requests,
-            autotune=self.autotune if autotune is None else autotune,
+            autotune=(self.autotune if autotune is None else autotune)
+            and self._autotune_effort is not AutotuneEffort.OFF,
         )
         self._job = job
         if self.state != "FROZEN":
@@ -556,7 +560,7 @@ class PreparationSession:
                 self._pool.wait_for_progress()
 
     def candidate_memory_envelope(self, requests):
-        """Return the largest scratch envelope across every legal config."""
+        """Return the largest scratch envelope across eligible configurations."""
         self._check_thread()
         if self._job is not None:
             raise RuntimeError("cannot inspect memory while preparation is active")
@@ -568,10 +572,13 @@ class PreparationSession:
                 plan.query,
                 device=self.device.identity,
                 override=plan.override,
+                search=self._autotune_effort is not AutotuneEffort.OFF,
             )
             configs = (
                 (configuration.pinned,)
                 if configuration.pinned is not None
+                else (configuration.default,)
+                if self._autotune_effort is AutotuneEffort.OFF
                 else (
                     configuration.default,
                     *(config for _, config in plan.contract.iterate(configuration)),
@@ -1291,7 +1298,10 @@ class PreparationJob:
                 obligation.selection = self._selection(
                     obligation, configuration.pinned, "override"
                 )
-            elif self._warmup_only:
+            elif self._warmup_only or (
+                configuration.space is not None
+                and configuration.space.autotune_effort is AutotuneEffort.OFF
+            ):
                 obligation.selection = self._selection(
                     obligation, configuration.default, "default"
                 )

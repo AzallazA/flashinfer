@@ -15,6 +15,7 @@ from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
 from b12x._lib.scratch import scratch_buffer_spec
+from b12x.preparation._efficiency import capture_autotune_effort
 from b12x.preparation.types import (
     FrozenMapping,
     MemoryRequirements,
@@ -252,6 +253,7 @@ def _query(
         shared_input_scales=experts._impl.can_share_input(input_scales_static=True),
         csf_inline_scales=plan.csf_inline_scales,
         a4_prefill=invocation.get("a4_prefill"),
+        autotune_effort=capture_autotune_effort().value,
     )
 
 
@@ -282,6 +284,13 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
         else tuple(plan.trellis_pair_kinds),
         "intermediate_hadamard_blocks": plan.intermediate_hadamard_blocks,
     }
+
+
+def _program_query_payload(query: MoeDecodeQuery) -> dict[str, object]:
+    """Encode kernel inputs without search-effort policy."""
+    payload = query.to_dict()
+    payload.pop("autotune_effort")
+    return payload
 
 
 def _decode_query(payload) -> MoeDecodeQuery:
@@ -1467,7 +1476,7 @@ def plan(
             return (
                 CompileJob.create(
                     "b12x.moe.fused_moe._preparation:compile_fused_moe",
-                    TUNING.encode_query(query),
+                    _program_query_payload(query),
                     TUNING.encode_config(config),
                     weight_payload,
                     scale_counts,
@@ -1505,7 +1514,7 @@ def plan(
         def materialize(selection, device):
             caps = caps_for(selection.config, device)
             programs = compile_fused_moe(
-                TUNING.encode_query(query),
+                _program_query_payload(query),
                 TUNING.encode_config(selection.config),
                 weight_payload,
                 scale_counts,

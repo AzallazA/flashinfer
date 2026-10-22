@@ -6,7 +6,13 @@ import math
 from dataclasses import dataclass
 
 from b12x.preparation import DeviceIdentity, FrozenMapping
-from b12x.preparation.tuning import Knob, ParameterBinding, TuningContract
+from b12x.preparation._efficiency import AutotuneEffort, EfficiencyPredicate
+from b12x.preparation.tuning import (
+    Knob,
+    ParameterBinding,
+    ParameterSpace,
+    TuningContract,
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -31,6 +37,7 @@ class HyperConnectionQuery:
     add_residual: bool = False
     gate_stride: int = 0
     paired: bool = False
+    autotune_effort: str = "medium"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -82,8 +89,12 @@ def _default_config(
     return HyperConnectionConfig(
         backend="cutedsl",
         reduction_block_h=reduction_block_h,
-        pointwise_block=256,
-        reduction_num_warps=8 if reduction_block_h >= 2048 else 4,
+        pointwise_block=min(256, reduction_block_h)
+        if query.operation == "gate_mean"
+        else 256,
+        reduction_num_warps=8
+        if _uses_triton_reduction(query) and reduction_block_h >= 2048
+        else 4,
     )
 
 
@@ -109,6 +120,7 @@ def _validate(
 def _validate_query(query, device):
     if not isinstance(query, HyperConnectionQuery):
         raise TypeError("query must be HyperConnectionQuery")
+    AutotuneEffort(query.autotune_effort)
     if query.operation not in (
         "grouped_rmsnorm",
         "scaled_silu",
@@ -219,32 +231,49 @@ def _validate_query(query, device):
         raise ValueError("token masks apply only to Engram mixing")
 
 
+def _uses_triton_reduction(query):
+    return query.operation == "grouped_rmsnorm" and (
+        query.zero_centered
+        or query.add_residual
+        or query.paired
+        or query.dtype == "float32"
+        or query.output_dtype == "float32"
+    )
+
+
 def _tuning_parameters(query, device):
     operation = query.operation
     covering = 1 << (query.hidden_size - 1).bit_length()
-    # The owned vector domain includes the covering reduction and one overtile;
-    # the reduction keeps that overtile as an explicit tuning range, not the
-    # language's arange cap. The gate-mean launch fixes four warps per block and
-    # grids cdiv(hidden_size, pointwise_block) blocks, so a partition wider than
-    # the covering block adds only masked lanes to a single block. The floor of
-    # one warp is a measured bound, not a dominance argument: a narrower
-    # partition trades idle lanes for more blocks, and in gate_mean timings
-    # every partition below 32 lanes trailed the best in-range partition by 1.7x
-    # or more, reaching 40x at a single lane.
-    blocks = tuple(
-        block
-        for block in (1 << exponent for exponent in range(covering.bit_length()))
-        if block >= min(32, covering)
-    )
-    return {
+    # Wider gate partitions add only masked lanes after the covering block.
+    blocks = tuple(1 << exponent for exponent in range(covering.bit_length()))
+    triton_reduction = _uses_triton_reduction(query)
+    values = {
         "reduction_block_h": (covering, 2 * covering)
-        if operation == "grouped_rmsnorm" and query.zero_centered
+        if triton_reduction
         else (covering,),
         "pointwise_block": blocks if operation == "gate_mean" else (256,),
-        "reduction_num_warps": (1, 2, 4, 8)
-        if operation == "grouped_rmsnorm" and query.zero_centered
-        else (4,),
+        "reduction_num_warps": (1, 2, 4, 8) if triton_reduction else (4,),
     }
+    return ParameterSpace.create(
+        TUNING.knobs,
+        values=values,
+        autotune_effort=AutotuneEffort(query.autotune_effort),
+        efficiency_predicates=(
+            EfficiencyPredicate(
+                lambda c: (
+                    operation != "gate_mean"
+                    or c["pointwise_block"] >= min(32, covering)
+                ),
+                minimum_effort="high",
+            ),
+            EfficiencyPredicate(
+                lambda c: (
+                    operation != "gate_mean" or c["pointwise_block"] >= min(8, covering)
+                ),
+                minimum_effort="max",
+            ),
+        ),
+    )
 
 
 def _materialize_tuning(
@@ -262,7 +291,7 @@ def _materialize_tuning(
 
 TUNING = TuningContract(
     component_id="norm.hyperconnection",
-    query_schema_version=27,
+    query_schema_version=28,
     config_schema_version=22,
     query_fields=frozenset(HyperConnectionQuery.__dataclass_fields__),
     config_fields=frozenset(HyperConnectionConfig.__dataclass_fields__),
@@ -272,7 +301,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate,
     default_config=_default_config,
-    candidate_contract_version=7,
+    candidate_contract_version=8,
     knobs=(
         Knob(name="reduction_block_h", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="pointwise_block", values=None, binding=ParameterBinding.COMPILE),

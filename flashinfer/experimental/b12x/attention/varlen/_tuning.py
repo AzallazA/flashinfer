@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from b12x.preparation._efficiency import capture_exhaustive_search
+from b12x.preparation._efficiency import (
+    EfficiencyPredicate,
+    capture_autotune_effort,
+    capture_exhaustive_search,
+)
 
 from b12x.preparation import (
     DeviceIdentity,
@@ -36,6 +40,7 @@ class VarlenAttentionQuery:
     block_tile_m: int = 0
     block_tile_n: int = 0
     exhaustive: bool = field(default_factory=capture_exhaustive_search)
+    autotune_effort: str = field(default_factory=capture_autotune_effort)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -86,12 +91,19 @@ def _validate_query(
     if query.math_mode not in ("flash", "eager_bf16"):
         raise ValueError(f"unsupported attention math mode {query.math_mode!r}")
     if query.math_mode == "eager_bf16" and (
-        query.variant != "varlen" or query.dtype != "bfloat16"
-        or query.causal or query.block_sparse or query.per_segment_tiles
+        query.variant != "varlen"
+        or query.dtype != "bfloat16"
+        or query.causal
+        or query.block_sparse
+        or query.per_segment_tiles
         or query.q_heads != query.kv_heads
-        or query.query_rows <= 0 or query.kv_rows <= 0 or query.batch_size <= 0
+        or query.query_rows <= 0
+        or query.kv_rows <= 0
+        or query.batch_size <= 0
     ):
-        raise ValueError("eager_bf16 requires dense noncausal BF16 varlen attention with equal Q/KV heads")
+        raise ValueError(
+            "eager_bf16 requires dense noncausal BF16 varlen attention with equal Q/KV heads"
+        )
     if query.variant not in ("batched", "varlen"):
         raise ValueError(f"unsupported attention variant {query.variant!r}")
     if query.dtype not in ("bfloat16", "float16"):
@@ -138,6 +150,7 @@ def _tuning_parameters(
             TUNING.knobs,
             values={"tile_m": (query.block_tile_m,), "tile_n": (query.block_tile_n,)},
             exhaustive=query.exhaustive,
+            autotune_effort=query.autotune_effort,
         )
     capacity = utils.get_smem_capacity_in_bytes("sm_120")
     q_width = (query.q_head_dim + 15) // 16 * 16
@@ -149,7 +162,11 @@ def _tuning_parameters(
             "tile_n": range(16, capacity // (2 * (q_width + v_width)) + 1, 16),
         },
         exhaustive=query.exhaustive,
-        efficiency_predicates=(lambda p: p["tile_m"] <= 128,),
+        autotune_effort=query.autotune_effort,
+        efficiency_predicates=(
+            EfficiencyPredicate(lambda p: p["tile_m"] <= 128, minimum_effort="high"),
+            lambda p: p["tile_m"] <= 256,
+        ),
     )
 
 

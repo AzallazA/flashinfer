@@ -1167,6 +1167,7 @@ def _plan_decode_graph_capacity_heuristic(
     max_work_items: int | None = None,
     max_partial_rows: int | None = None,
     force_split_kv: bool | None = None,
+    apply_chunk_efficiency_policy: bool = True,
 ) -> PagedDecodeGraphCapacity:
     """Return the fixed capacity for a graph-safe decode bucket.
 
@@ -1278,7 +1279,7 @@ def _plan_decode_graph_capacity_heuristic(
         batch=batch,
         query_tiles_per_request=query_tiles_per_request,
     )
-    if one_wave_chunks is not None:
+    if apply_chunk_efficiency_policy and one_wave_chunks is not None:
         max_chunks_budget = min(max_chunks_budget, one_wave_chunks)
     gqa8_chunks = _h256_gqa8_decode_chunk_budget(
         device=device,
@@ -1293,9 +1294,9 @@ def _plan_decode_graph_capacity_heuristic(
         max_effective_kv_pages=max_effective_kv_pages,
         window_left=window_left,
     )
-    if gqa8_chunks is not None:
+    if apply_chunk_efficiency_policy and gqa8_chunks is not None:
         max_chunks_budget = min(max_chunks_budget, gqa8_chunks)
-    if graph_ctas_per_sm is None:
+    if apply_chunk_efficiency_policy and graph_ctas_per_sm is None:
         h256_one_wave_chunks = _h256_one_wave_decode_chunk_budget(
             device=device,
             q_dtype=q_dtype,
@@ -1356,7 +1357,22 @@ def _plan_decode_graph_capacity_heuristic(
                 analytic_total_work_budget, max_partial_rows
             )
 
-    if split_policy_supported and force_split_kv is not False:
+    if (
+        split_policy_supported
+        and force_split_kv is not False
+        and not apply_chunk_efficiency_policy
+    ):
+        chunk_pages_lut = tuple(
+            _cap_decode_graph_chunk_pages(
+                chunk_pages=_apply_decode_graph_chunk_pages_debug_policy(
+                    max(_ceil_div(page_count, max_chunks_budget), 1)
+                ),
+                max_effective_kv_pages=page_count,
+                max_chunks_per_req=max_chunks_budget,
+            )
+            for page_count in range(1, max_effective_kv_pages + 1)
+        )
+    elif split_policy_supported and force_split_kv is not False:
         chunk_pages_lut = build_decode_chunk_pages_lut(
             q_dtype=q_dtype,
             kv_dtype=kv_dtype,

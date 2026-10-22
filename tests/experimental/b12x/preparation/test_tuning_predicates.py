@@ -492,7 +492,7 @@ def test_moe_cluster_ladder_stops_at_the_planned_task_queue():
             space.validate({**triton, "max_active_clusters": outside})
 
 
-def test_a16_wide_tile_needs_more_than_one_n_tile():
+def test_a16_small_m_mxfp8_wide_tile_remains_eligible():
     from b12x.gemm.blockscaled._tuning import TUNING, BlockscaledQuery
 
     narrow = BlockscaledQuery(
@@ -507,8 +507,7 @@ def test_a16_wide_tile_needs_more_than_one_n_tile():
         mode="a16", tile_m=16, tile_n=64, tile_k=64, split_k=1, mma_warps=4
     )
     space.validate(assignment)
-    with pytest.raises(ValueError, match="predicates"):
-        space.validate({**assignment, "tile_n": 128})
+    space.validate({**assignment, "tile_n": 128})
     wide = TUNING.parameter_space(replace(narrow, out_features=128), IDENTITY)
     wide.validate({**assignment, "tile_n": 128})
 

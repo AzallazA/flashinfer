@@ -432,7 +432,9 @@ def plan(
         return (
             CompileJob.create(
                 "b12x.attention.dsa_indexer._preparation:compile_indexer",
-                TUNING.encode_query(replace(query, exhaustive=False)),
+                TUNING.encode_query(
+                    replace(query, exhaustive=False, autotune_effort="medium")
+                ),
                 TUNING.encode_config(config),
                 device.ordinal,
             ),
@@ -463,7 +465,9 @@ def plan(
 
     def materialize(selection, device):
         programs = compile_indexer(
-            TUNING.encode_query(replace(query, exhaustive=False)),
+            TUNING.encode_query(
+                replace(query, exhaustive=False, autotune_effort="medium")
+            ),
             TUNING.encode_config(selection.config),
             device.ordinal,
         )

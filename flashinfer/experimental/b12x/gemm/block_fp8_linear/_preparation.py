@@ -6,7 +6,7 @@ import b12x._lib.dense_gemm.buffers as _module__lib_dense_gemm_buffers
 import b12x._lib.dense_gemm.preparation as _module__lib_dense_gemm_preparation
 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -248,11 +248,15 @@ def plan(
         weight_block_size=caps.block_size[0],
     )
 
+    compile_query = TUNING.encode_query(
+        replace(query, exhaustive=False, autotune_effort="medium")
+    )
+
     def compile_jobs(config, device):
         return (
             CompileJob.create(
                 "b12x.gemm.block_fp8_linear._preparation:compile_block_fp8",
-                TUNING.encode_query(query),
+                compile_query,
                 TUNING.encode_config(config),
                 device.ordinal,
                 device.identity.sm_count,
@@ -281,7 +285,7 @@ def plan(
     def materialize(selection, device):
         config = selection.config
         programs = compile_block_fp8(
-            TUNING.encode_query(query),
+            compile_query,
             TUNING.encode_config(config),
             device.ordinal,
             device.identity.sm_count,

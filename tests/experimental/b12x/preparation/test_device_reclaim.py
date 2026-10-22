@@ -40,7 +40,7 @@ def test_race_reclaims_device_memory_once_after_every_trial_closes(
         kept = frozenset(result.plans["first"].prepared.programs)
     # A host device has no stack limit; every trial closed before the reclaim ran.
     assert reclaimed == [(kept, None, [3, 6, 12])]
-    with session(tmp_path, autotune=False) as engine:
+    with session(tmp_path, autotune=False, cache_only=True) as engine:
         result = engine.prepare(
             (request(name="cached", tuning=contract(), calls=calls),)
         )

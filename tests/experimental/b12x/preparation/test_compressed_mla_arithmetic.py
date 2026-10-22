@@ -71,7 +71,7 @@ def test_bf16_restricts_arithmetic_and_retains_other_tuning_domains(
     assert auto_domains.pop("v41_compute_mode") == ("fp8", "bf16")
     assert domains == auto_domains
     encoded = constrained.contract.encode_query(constrained.query)
-    assert constrained.contract.query_schema_version == 24
+    assert constrained.contract.query_schema_version == 26
     assert "compute_mode" in constrained.contract.query_fields
     assert "v41_compute_mode" not in encoded
     assert encoded["compute_mode"] == "bf16"
@@ -96,7 +96,7 @@ def test_auto_retains_default_candidates_and_query_cache_identity(heads, mode):
     implicit = declaration(heads=heads, mode=mode)
     explicit = declaration(heads=heads, mode=mode, arithmetic="auto")
     assert implicit.contract is TUNING and explicit.contract is TUNING
-    assert TUNING.query_schema_version == 22
+    assert TUNING.query_schema_version == 25
     legacy_payload = asdict(implicit.query)
     del legacy_payload["compute_mode"]
     assert implicit.contract.encode_query(implicit.query) == legacy_payload

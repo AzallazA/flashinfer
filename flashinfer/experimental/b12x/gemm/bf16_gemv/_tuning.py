@@ -1,8 +1,13 @@
 """Startup selection for unquantized BF16 and FP32 projections."""
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 
 from b12x.preparation import Knob, ParameterBinding, ParameterSpace, TuningContract
+from b12x.preparation._efficiency import (
+    AutotuneEffort,
+    EfficiencyPredicate,
+    capture_autotune_effort,
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -20,6 +25,12 @@ class GemvQuery:
     output_contiguous: bool = True
     output_aligned: bool = True
     bias_dtype: str | None = None
+    autotune_effort: str = field(default_factory=capture_autotune_effort)
+
+    def __post_init__(self):
+        object.__setattr__(
+            self, "autotune_effort", AutotuneEffort(self.autotune_effort).value
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -61,11 +72,11 @@ def validate_query(query):
 
 
 def _mma_eligible(query):
-    return (
-        query.source_dtype == query.weight_dtype == "bfloat16"
-        and query.out_features >= 256
-        and query.in_features >= 16
-    )
+    return query.source_dtype == query.weight_dtype == "bfloat16"
+
+
+def _mma_preferred(query):
+    return query.out_features >= 256 and query.in_features >= 16
 
 
 def _tc_eligible(query):
@@ -102,8 +113,7 @@ def _prefill_eligible(query):
     return (
         query.bias_dtype is None
         and query.source_dtype == query.weight_dtype == "bfloat16"
-        and (query.out_features, query.in_features)
-        in ((384, 5120), (512, 5120), (1024, 5120))
+        and query.in_features % 64 == 0
         and query.source_contiguous
         and query.source_aligned
         and query.weight_contiguous
@@ -113,15 +123,31 @@ def _prefill_eligible(query):
     )
 
 
+def _prefill_preferred(query):
+    return (query.out_features, query.in_features) in (
+        (384, 5120),
+        (512, 5120),
+        (1024, 5120),
+    )
+
+
 def default_config(query, device):
     prefill_min_rows = 128 if query.out_features == 1024 else 256
-    if _prefill_eligible(query) and query.max_rows >= prefill_min_rows:
+    if (
+        _prefill_eligible(query)
+        and _prefill_preferred(query)
+        and query.max_rows >= prefill_min_rows
+    ):
         return GemvConfig(backend="prefill")
     if _torch_eligible(query) and query.max_rows > 8:
         return GemvConfig(backend="torch")
     n_tiles = (query.out_features + 63) // 64
     minimum_mma_rows = 24 if n_tiles >= 64 else ((64 + n_tiles - 1) // n_tiles) * 32
-    if _mma_eligible(query) and query.max_rows >= minimum_mma_rows:
+    if (
+        _mma_eligible(query)
+        and _mma_preferred(query)
+        and query.max_rows >= minimum_mma_rows
+    ):
         return GemvConfig(backend="mma")
     rows_per_tile = 8
     if (
@@ -190,6 +216,23 @@ def _parameters(query, device):
         TUNING.knobs,
         values={"backend": tuple(backends)},
         predicates=(_eligible,),
+        efficiency_predicates=(
+            EfficiencyPredicate(
+                lambda choice: (
+                    (choice["backend"] != "mma" or _mma_preferred(query))
+                    and (choice["backend"] != "prefill" or _prefill_preferred(query))
+                ),
+                minimum_effort="high",
+            ),
+            EfficiencyPredicate(
+                lambda choice: (
+                    choice["backend"] != "simt"
+                    or (choice["rows_per_tile"] != 1 and choice["block_threads"] == 128)
+                ),
+                minimum_effort="medium",
+            ),
+        ),
+        autotune_effort=query.autotune_effort,
     )
 
 
@@ -201,7 +244,7 @@ def _eligible(choice):
 
 TUNING = TuningContract(
     component_id="gemm.bf16_gemv",
-    query_schema_version=22,
+    query_schema_version=23,
     config_schema_version=23,
     query_fields=frozenset(field.name for field in fields(GemvQuery)),
     config_fields=frozenset(field.name for field in fields(GemvConfig)),
@@ -218,7 +261,7 @@ TUNING = TuningContract(
         ),
         Knob(name="block_threads", values=(128, 256), binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=7,
+    candidate_contract_version=8,
     parameters=_parameters,
     materialize=lambda query, device, choice: GemvConfig(**dict(choice)),
 )

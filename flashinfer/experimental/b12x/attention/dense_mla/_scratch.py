@@ -177,6 +177,8 @@ class _ScratchLayout:
 
 def _dense_mla_scratch_layout(
     caps: Caps,
+    *,
+    num_splits: int | None = None,
 ) -> _ScratchLayout:
     query_tile = _query_tile(caps)
     max_attended_tokens = _max_attended_tokens(caps)
@@ -197,14 +199,30 @@ def _dense_mla_scratch_layout(
             )
     else:
         sm_count = 1
-    num_splits = choose_num_splits(
-        max_cache_tokens=max_attended_tokens,
-        max_total_q=caps.max_total_q,
-        num_q_heads=caps.num_q_heads,
-        query_tile=query_tile,
-        sm_count=sm_count,
-        budget=caps.budget,
-    )
+    if num_splits is None:
+        num_splits = choose_num_splits(
+            max_cache_tokens=max_attended_tokens,
+            max_total_q=caps.max_total_q,
+            num_q_heads=caps.num_q_heads,
+            query_tile=query_tile,
+            sm_count=sm_count,
+            budget=caps.budget,
+        )
+    else:
+        if type(num_splits) is not int or not (
+            1 <= num_splits <= (caps.max_cache_tokens + 63) // 64
+        ):
+            raise ValueError(
+                "dense MLA split count must be within the cache chunk count"
+            )
+        if (
+            caps.budget is not None
+            and caps.budget.max_splits is not None
+            and num_splits > caps.budget.max_splits
+        ):
+            raise ValueError(
+                "dense MLA split count exceeds the configured split budget"
+            )
     num_chunks = (max_attended_tokens + 63) // 64
     chunks_per_split = (num_chunks + num_splits - 1) // num_splits
     partial_rows = caps.max_total_q * num_splits
@@ -685,8 +703,10 @@ class Plan:
 
 def plan_dense_mla_scratch(
     caps: Caps,
+    *,
+    num_splits: int | None = None,
 ) -> Plan:
-    layout = _dense_mla_scratch_layout(caps)
+    layout = _dense_mla_scratch_layout(caps, num_splits=num_splits)
     return Plan(
         caps=caps,
         layout=layout,

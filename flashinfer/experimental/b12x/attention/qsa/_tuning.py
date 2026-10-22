@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from b12x.preparation._efficiency import (
+    AutotuneEffort,
+    EfficiencyPredicate,
+    capture_autotune_effort,
+)
 
 from ._sparse_gqa_cute_config import (
     BLOCK_N as _QWEN_CUTE_BLOCK_N,
@@ -14,6 +20,7 @@ from b12x.preparation import (
     FrozenMapping,
     Knob,
     ParameterBinding,
+    ParameterSpace,
     TuningContract,
 )
 
@@ -50,9 +57,13 @@ class QsaQuery:
     cp_kv_cache_interleave_size: int = 1
     attention_splits: int = 0
     score_workspace_bytes: int | None = None
+    autotune_effort: AutotuneEffort = field(default_factory=capture_autotune_effort)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "abi", FrozenMapping(self.abi))
+        object.__setattr__(
+            self, "autotune_effort", AutotuneEffort(self.autotune_effort)
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -86,7 +97,13 @@ class QsaQuery:
             "attention_splits": self.attention_splits,
             "score_workspace_bytes": self.score_workspace_bytes,
             "abi": self.abi,
+            "autotune_effort": self.autotune_effort.value,
         }
+
+    def program_payload(self) -> dict[str, object]:
+        payload = self.to_dict()
+        payload.pop("autotune_effort")
+        return payload
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -304,9 +321,22 @@ def _encode_query(query: QsaQuery) -> dict[str, object]:
     }
 
 
+def _parameters(query: QsaQuery, _device: DeviceIdentity | None) -> ParameterSpace:
+    return ParameterSpace.create(
+        TUNING.knobs,
+        autotune_effort=query.autotune_effort,
+        efficiency_predicates=(
+            EfficiencyPredicate(
+                lambda p: p["sparse_gqa_direct_kv_warps"] == 2,
+                minimum_effort="medium",
+            ),
+        ),
+    )
+
+
 TUNING = TuningContract(
     component_id="attention.qsa",
-    query_schema_version=23,
+    query_schema_version=24,
     config_schema_version=22,
     query_fields=_KEY_FIELDS,
     config_fields=frozenset(QsaConfig.__dataclass_fields__),
@@ -320,11 +350,12 @@ TUNING = TuningContract(
         Knob(name="backend", values=("cutedsl",), binding=ParameterBinding.COMPILE),
         Knob(
             name="sparse_gqa_direct_kv_warps",
-            values=(2,),
+            values=(1, 2, 4),
             binding=ParameterBinding.COMPILE,
         ),
     ),
-    candidate_contract_version=4,
+    parameters=_parameters,
+    candidate_contract_version=5,
 )
 
 

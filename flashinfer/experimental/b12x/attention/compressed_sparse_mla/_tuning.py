@@ -2,20 +2,27 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 
 from b12x.preparation import (
     DeviceIdentity,
     FrozenMapping,
     Knob,
     ParameterBinding,
+    ParameterSpace,
     TuningContract,
+)
+from b12x.preparation._efficiency import (
+    AutotuneEffort,
+    EfficiencyPredicate,
+    capture_autotune_effort,
+    powers_of_two,
 )
 
 
 @dataclass(frozen=True, kw_only=True)
 class SparseMlaQuery:
-    """All compile-identity metadata for the DSV4 compressed MLA path.
+    """Storage, numerical and search metadata for compressed MLA preparation.
 
     Per-request sequence lengths, selected page IDs, and their contents remain
     dynamic inputs; capacity, storage layout, operand form, and numerical output
@@ -56,6 +63,7 @@ class SparseMlaQuery:
     lse_scale: str
     output_mode: str
     compute_mode: str = "auto"
+    autotune_effort: AutotuneEffort = field(default_factory=capture_autotune_effort)
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -255,9 +263,7 @@ def _validate_config(
         )
 
 
-def _parameters(
-    query: SparseMlaQuery, device: DeviceIdentity | None
-) -> dict[str, tuple[object, ...]]:
+def _parameters(query: SparseMlaQuery, device: DeviceIdentity | None) -> ParameterSpace:
     default = _default_config(query, device)
     if query.cache_format == "deepseek_v4":
         modes = (default.v41_compute_mode,)
@@ -267,13 +273,41 @@ def _parameters(
             ("fp8", "bf16") if query.compute_mode == "auto" else (query.compute_mode,)
         )
         head_blocks = (8, 16)
-    return {
-        "max_chunks_per_row": (default.max_chunks_per_row,),
-        "split_chunk_size": (default.split_chunk_size,),
-        "single_pass": (default.single_pass,),
-        "v41_compute_mode": modes,
-        "v41_heads_per_block": head_blocks,
-    }
+
+    def geometries(limits):
+        if default.single_pass:
+            return frozenset({(1, 1)})
+        return frozenset(
+            (split.num_chunks, split.chunk_size)
+            for limit in limits
+            for split in (_split_config(query, limit),)
+        )
+
+    legal = geometries(range(1, 257))
+    low = geometries((256,))
+    medium = geometries(powers_of_two(256))
+    high = geometries((*range(1, 33), *range(40, 257, 8)))
+
+    def pair(choice):
+        return choice["max_chunks_per_row"], choice["split_chunk_size"]
+
+    return ParameterSpace.create(
+        TUNING.knobs,
+        values={
+            "max_chunks_per_row": tuple(sorted({capacity for capacity, _ in legal})),
+            "split_chunk_size": tuple(sorted({chunk for _, chunk in legal})),
+            "single_pass": (default.single_pass,),
+            "v41_compute_mode": modes,
+            "v41_heads_per_block": head_blocks,
+        },
+        predicates=(lambda choice: pair(choice) in legal,),
+        efficiency_predicates=(
+            EfficiencyPredicate(lambda choice: pair(choice) in low, "medium"),
+            EfficiencyPredicate(lambda choice: pair(choice) in medium, "high"),
+            EfficiencyPredicate(lambda choice: pair(choice) in high, "max"),
+        ),
+        autotune_effort=query.autotune_effort,
+    )
 
 
 def _materialize(
@@ -286,7 +320,7 @@ def _materialize(
 
 TUNING = TuningContract(
     component_id="attention.compressed_sparse_mla",
-    query_schema_version=22,
+    query_schema_version=25,
     config_schema_version=22,
     query_fields=frozenset(SparseMlaQuery.__dataclass_fields__) - {"compute_mode"},
     config_fields=frozenset(SparseMlaConfig.__dataclass_fields__),
@@ -303,7 +337,7 @@ TUNING = TuningContract(
         Knob(name="v41_compute_mode", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="v41_heads_per_block", values=None, binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=5,
+    candidate_contract_version=6,
     parameters=_parameters,
     materialize=_materialize,
     equivalence_key=lambda query, _device, config: (
@@ -319,7 +353,7 @@ TUNING = TuningContract(
 
 _ARITHMETIC_TUNING = replace(
     TUNING,
-    query_schema_version=24,
+    query_schema_version=26,
     query_fields=frozenset(SparseMlaQuery.__dataclass_fields__),
 )
 

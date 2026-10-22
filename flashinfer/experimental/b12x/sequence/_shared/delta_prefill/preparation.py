@@ -241,7 +241,7 @@ def make_plan(caps, impl, tuning, *, invocation, override):
             CompileJob.create(
                 "b12x.sequence._shared.delta_prefill.preparation:compile_prefill",
                 component,
-                replace(query, exhaustive=False).to_dict(),
+                replace(query, exhaustive=False, autotune_effort="medium").to_dict(),
                 tuning.TUNING.encode_config(config),
                 device.ordinal,
             ),
@@ -259,7 +259,7 @@ def make_plan(caps, impl, tuning, *, invocation, override):
         native_layout = layout(selection.config)
         programs = compile_prefill(
             component,
-            replace(query, exhaustive=False).to_dict(),
+            replace(query, exhaustive=False, autotune_effort="medium").to_dict(),
             tuning.TUNING.encode_config(selection.config),
             device.ordinal,
         )

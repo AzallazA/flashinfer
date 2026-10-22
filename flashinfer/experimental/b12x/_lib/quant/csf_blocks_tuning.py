@@ -3,9 +3,13 @@
 The tuner sweeps work per CTA, exception placement, and expert-presence
 construction. Scale payloads and native outputs remain caller-owned. Each
 prepared binding uses one fixed expert-presence scratch tensor.
+
+Direct duplicate checks are compared above the expert count only at max effort.
+Routing capacities below 64 retain direct checks; capacities at least sixteen
+times the expert count expand every expert at every effort.
 """
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 
 import torch
 
@@ -21,6 +25,11 @@ from b12x.preparation import (
     Plan,
     TuningContract,
 )
+from b12x.preparation._efficiency import (
+    AutotuneEffort,
+    EfficiencyPredicate,
+    capture_autotune_effort,
+)
 from b12x._lib.quant.csf_blocks import Nvfp4CompactBlockPlane
 from b12x._lib.quant.csf_routing import compile_csf_active_experts
 from b12x._lib.quant.nvfp4_csf import Nvfp4CsfDecoder, compile_nvfp4_csf_pair
@@ -32,6 +41,7 @@ class CsfExpansionQuery:
     second: tuple[int, ...]
     routes: int
     ids_dtype: str
+    autotune_effort: str = field(default_factory=capture_autotune_effort)
 
 
 @dataclass(frozen=True)
@@ -61,6 +71,7 @@ def _validate_query(query, device):
         raise ValueError("CSF expansion requires a positive route capacity")
     if query.ids_dtype not in ("int32", "int64"):
         raise ValueError("CSF expansion routes require int32 or int64")
+    AutotuneEffort(query.autotune_effort)
     for geometry in (query.first, query.second):
         if (
             len(geometry) != 9
@@ -105,17 +116,22 @@ def _parameters(query, device):
     return ParameterSpace.create(
         TUNING.knobs,
         values={
-            "direct_routes": (False, True)
-            if _uses_presence(query) and query.routes <= query.first[6]
-            else (False,),
+            "direct_routes": (False, True) if _uses_presence(query) else (False,),
             "bitmap_routes": (False, True) if _uses_presence(query) else (False,),
         },
+        efficiency_predicates=(
+            EfficiencyPredicate(
+                lambda p: not p["direct_routes"] or query.routes <= query.first[6],
+                minimum_effort=AutotuneEffort.MAX,
+            ),
+        ),
+        autotune_effort=query.autotune_effort,
     )
 
 
 TUNING = TuningContract(
     component_id="quantization.csf_block_expansion",
-    query_schema_version=8,
+    query_schema_version=9,
     config_schema_version=2,
     query_fields=frozenset(CsfExpansionQuery.__dataclass_fields__),
     config_fields=frozenset(CsfExpansionConfig.__dataclass_fields__),
@@ -146,9 +162,17 @@ TUNING = TuningContract(
 )
 
 
+def _program_query_payload(query):
+    payload = asdict(query)
+    payload.pop("autotune_effort")
+    return payload
+
+
 @program_cache(scope="preparation")
 def compile_expansion(query_payload, config_payload, ordinal):
-    query = CsfExpansionQuery(**dict(query_payload))
+    values = dict(query_payload)
+    values.setdefault("autotune_effort", AutotuneEffort.MEDIUM)
+    query = CsfExpansionQuery(**values)
     config = CsfExpansionConfig.from_config(config_payload)
     geometries = tuple(
         (
@@ -263,7 +287,7 @@ def plan_csf_block_expansion(
         return (
             CompileJob.create(
                 "b12x._lib.quant.csf_blocks_tuning:compile_expansion",
-                TUNING.encode_query(query),
+                _program_query_payload(query),
                 TUNING.encode_config(config),
                 device.ordinal,
             ),
@@ -282,7 +306,7 @@ def plan_csf_block_expansion(
             for p in (first, second)
         )
         programs, routing = compile_expansion(
-            TUNING.encode_query(query), TUNING.encode_config(config), device.ordinal
+            _program_query_payload(query), TUNING.encode_config(config), device.ordinal
         )
         return _ExpansionState(
             query,

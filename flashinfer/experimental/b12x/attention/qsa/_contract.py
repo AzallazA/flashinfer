@@ -1635,12 +1635,11 @@ def plan(
         override=override,
         _device=caps.device,
         shared=False,
-        # Compile factories and materialization receive the full declared
-        # query; the selection key omits the pool's page counts.
+        # Compile metadata retains pool geometry and omits search effort.
         _compile_jobs=lambda config, device: (
             CompileJob.create(
                 "b12x.attention.qsa._contract:compile_qsa",
-                query.to_dict(),
+                query.program_payload(),
                 TUNING.encode_config(config),
                 device.ordinal,
             ),
@@ -1652,7 +1651,7 @@ def plan(
             _materialize(caps, query.abi, selection.config),
             programs=load_programs(
                 compile_qsa(
-                    query.to_dict(),
+                    query.program_payload(),
                     TUNING.encode_config(selection.config),
                     device.ordinal,
                 )

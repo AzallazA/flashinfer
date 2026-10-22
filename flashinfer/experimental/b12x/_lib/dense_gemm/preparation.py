@@ -372,6 +372,7 @@ def _lower_dense_gemm(
             is_mxfp8=is_mxfp8,
             is_mxfp6=is_mxfp6,
             block_fp8=block_fp8,
+            allow_fp4_swap=ab_dtype != "float4_e2m1fn" or sf_vec_size == 16,
             expected_m=expected_m,
             select_swapped_output_storage=(
                 use_default_output_storage

@@ -6,7 +6,11 @@ import os
 from dataclasses import dataclass, field
 
 from b12x.preparation import DeviceIdentity, FrozenMapping
-from b12x.preparation._efficiency import capture_exhaustive_search
+from b12x.preparation._efficiency import (
+    EfficiencyPredicate,
+    capture_autotune_effort,
+    capture_exhaustive_search,
+)
 from b12x.preparation.tuning import (
     Knob,
     ParameterBinding,
@@ -47,6 +51,7 @@ class DsaIndexerQuery:
     max_candidates: int = 0
     candidate_topk_blocks: int = 0
     exhaustive: bool = field(default_factory=capture_exhaustive_search)
+    autotune_effort: str = field(default_factory=capture_autotune_effort)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -213,8 +218,12 @@ def _parameters(query, _device):
             else (None,),
         },
         exhaustive=query.exhaustive,
+        autotune_effort=query.autotune_effort,
         efficiency_predicates=(
-            lambda p: not tensorcore_prefill or p["mxfp4_score_kind"] != "score",
+            EfficiencyPredicate(
+                lambda p: not tensorcore_prefill or p["mxfp4_score_kind"] != "score",
+                minimum_effort="high",
+            ),
         ),
     )
 

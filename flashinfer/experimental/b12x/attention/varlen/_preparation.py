@@ -595,7 +595,10 @@ def plan_batched(
 
     def materialize(selection, device):
         _, values, contiguous = _batched_payload(
-            TUNING.encode_query(replace(query, exhaustive=False)), invocation
+            TUNING.encode_query(
+                replace(query, exhaustive=False, autotune_effort="medium")
+            ),
+            invocation,
         )
         q_shape, k_shape, v_shape, dtype, selected_causal, left, right, has_sink = (
             values
@@ -627,7 +630,9 @@ def plan_batched(
         _compile_jobs=lambda config, device: (
             CompileJob.create(
                 "b12x.attention.varlen._preparation:compile_batched_attention",
-                TUNING.encode_query(replace(query, exhaustive=False)),
+                TUNING.encode_query(
+                    replace(query, exhaustive=False, autotune_effort="medium")
+                ),
                 invocation.to_dict(),
                 config.to_dict(),
                 device.ordinal,
@@ -727,7 +732,10 @@ def plan(
 
             return materialize(invocation, selection.config, device.ordinal)
         _, values, contiguous = _varlen_payload(
-            TUNING.encode_query(replace(query, exhaustive=False)), invocation
+            TUNING.encode_query(
+                replace(query, exhaustive=False, autotune_effort="medium")
+            ),
+            invocation,
         )
         (
             *shapes,
@@ -777,7 +785,9 @@ def plan(
         _compile_jobs=lambda config, device: (
             CompileJob.create(
                 "b12x.attention.varlen._preparation:compile_varlen_attention",
-                TUNING.encode_query(replace(query, exhaustive=False)),
+                TUNING.encode_query(
+                    replace(query, exhaustive=False, autotune_effort="medium")
+                ),
                 invocation.to_dict(),
                 config.to_dict(),
                 device.ordinal,

@@ -327,7 +327,7 @@ def test_mhc_program_bundle_reuse_obeys_deferred_and_resident_reclamation(monkey
     monkeypatch.setattr(program_cache, "_CACHES", {mhc._compile_mhc})
     monkeypatch.setattr(program_cache, "_MAPPING_CACHES", [])
     monkeypatch.setattr(compile_plan, "_NATIVE_JITS", set())
-    payload = {"codegen": {"constant": 1}}
+    payload = {"codegen": {"constant": 1}, "controls": {}}
     with program_cache.PreparationProgramCache().activate():
         planned = mhc.compile_mhc(payload, {}, {}, 0)
         assert mhc.compile_mhc(dict(payload), {}, {}, 0) is planned
@@ -386,7 +386,7 @@ def test_mhc_program_bundle_hit_still_validates_codegen_snapshot(monkeypatch):
         mhc, "_codegen_snapshot", lambda: FrozenMapping({"constant": 1})
     )
     with program_cache.PreparationProgramCache().activate():
-        payload = {"codegen": {"constant": 1}}
+        payload = {"codegen": {"constant": 1}, "controls": {}}
         mhc.compile_mhc(payload, {}, {}, 0)
         monkeypatch.setattr(
             mhc, "_codegen_snapshot", lambda: FrozenMapping({"constant": 2})

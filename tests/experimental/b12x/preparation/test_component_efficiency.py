@@ -368,15 +368,31 @@ def test_gqa_retains_residency_endpoints_and_explicit_controls(device):
     assert {1, 2, 3, 4, 6, 8, maximum} <= {p["graph_ctas_per_sm"] for p in assignments}
     assert {p["force_split_kv"] for p in assignments} == {False, True}
     with pytest.raises(ValueError, match="efficiency predicates"):
-        space.validate({"graph_ctas_per_sm": 5, "force_split_kv": False})
+        space.validate(
+            {
+                "graph_ctas_per_sm": 5,
+                "force_split_kv": False,
+                "apply_chunk_efficiency_policy": True,
+            }
+        )
     module.TUNING.parameter_space(replace(query, exhaustive=True), device).validate(
-        {"graph_ctas_per_sm": 5, "force_split_kv": False}
+        {
+            "graph_ctas_per_sm": 5,
+            "force_split_kv": False,
+            "apply_chunk_efficiency_policy": True,
+        }
     )
     explicit = replace(query, requested_graph_ctas_per_sm=5, force_split_kv=True)
     assert [
         dict(p)
         for p in module.TUNING.parameter_space(explicit, device).configurations()
-    ] == [{"graph_ctas_per_sm": 5, "force_split_kv": True}]
+    ] == [
+        {
+            "graph_ctas_per_sm": 5,
+            "force_split_kv": True,
+            "apply_chunk_efficiency_policy": True,
+        }
+    ]
 
 
 def test_dense_mla_compile_jobs_ignore_search_mode(monkeypatch):

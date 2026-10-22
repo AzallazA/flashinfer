@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from b12x.preparation._efficiency import capture_exhaustive_search
+from b12x.preparation._efficiency import (
+    EfficiencyPredicate,
+    capture_autotune_effort,
+    capture_exhaustive_search,
+)
 
 from b12x.preparation import (
     FrozenMapping,
@@ -50,6 +54,7 @@ class GdnPrefillQuery:
     dt_bias_dtype: str = "float32"
     state_indices_dtype: str = "int32"
     exhaustive: bool = field(default_factory=capture_exhaustive_search)
+    autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     @property
     def heads(self) -> int:
@@ -74,6 +79,7 @@ class GdnPrefillQuery:
             "dt_bias_dtype": self.dt_bias_dtype,
             "state_indices_dtype": self.state_indices_dtype,
             "exhaustive": self.exhaustive,
+            "autotune_effort": self.autotune_effort,
         }
 
 
@@ -218,6 +224,7 @@ def _tuning_parameters(query: GdnPrefillQuery, device):
                 for name, value in _default_config(query, device).to_dict().items()
             },
             exhaustive=query.exhaustive,
+            autotune_effort=query.autotune_effort,
         )
     del device
     capacity = tiles_capacity(query.max_tokens, query.max_seqs)
@@ -249,12 +256,20 @@ def _tuning_parameters(query: GdnPrefillQuery, device):
             "segment_tokens": SEGMENT_CHOICES,
         },
         exhaustive=query.exhaustive,
+        autotune_effort=query.autotune_effort,
         predicates=(
-            lambda p: query.recurrence_policy != "sequential_k1"
-            or (p["algorithm"] == "sequential" and p["k_split"] == 1),
+            lambda p: (
+                query.recurrence_policy != "sequential_k1"
+                or (p["algorithm"] == "sequential" and p["k_split"] == 1)
+            ),
         ),
         efficiency_predicates=(
-            lambda p: p["algorithm"] != "sequential" or p["window_tiles"] in windows,
+            EfficiencyPredicate(
+                lambda p: (
+                    p["algorithm"] != "sequential" or p["window_tiles"] in windows
+                ),
+                minimum_effort="high",
+            ),
             lambda p: (
                 p["algorithm"] != "chunk_parallel" or p["segment_tokens"] in segments
             ),

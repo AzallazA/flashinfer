@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from b12x.preparation._efficiency import capture_exhaustive_search, powers_of_two
+from b12x.preparation._efficiency import (
+    EfficiencyPredicate,
+    capture_autotune_effort,
+    capture_exhaustive_search,
+    powers_of_two,
+)
 
 from b12x.preparation import Knob, ParameterBinding, ParameterSpace, TuningContract
 from .._shared.delta_prefill.config import PrefillConfig, validate_metadata_query
@@ -39,6 +44,7 @@ class KdaPrefillQuery:
     dt_bias_dtype: str = "float32"
     state_indices_dtype: str = "int32"
     exhaustive: bool = field(default_factory=capture_exhaustive_search)
+    autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -56,6 +62,7 @@ class KdaPrefillQuery:
             "dt_bias_dtype": self.dt_bias_dtype,
             "state_indices_dtype": self.state_indices_dtype,
             "exhaustive": self.exhaustive,
+            "autotune_effort": self.autotune_effort,
         }
 
 
@@ -134,7 +141,12 @@ def _tuning_parameters(query: KdaPrefillQuery, device):
         TUNING.knobs,
         values={"window_tiles": range(1, capacity + 1)},
         exhaustive=query.exhaustive,
-        efficiency_predicates=(lambda p: p["window_tiles"] in windows,),
+        autotune_effort=query.autotune_effort,
+        efficiency_predicates=(
+            EfficiencyPredicate(
+                lambda p: p["window_tiles"] in windows, minimum_effort="high"
+            ),
+        ),
     )
 
 

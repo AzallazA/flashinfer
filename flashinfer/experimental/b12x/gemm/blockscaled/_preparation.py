@@ -36,8 +36,17 @@ from ._tuning import (
 _MXFP8_PREFILL_MIN_ROWS = 2048
 
 
+def _compile_query_payload(query):
+    return {
+        name: value
+        for name, value in TUNING.encode_query(query).items()
+        if name != "autotune_effort"
+    }
+
+
 def _decode_query(payload):
     values = dict(payload)
+    values["autotune_effort"] = "medium"
     values["codegen"] = FrozenMapping(values["codegen"])
     return BlockscaledQuery(**values)
 
@@ -595,7 +604,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         return (
             CompileJob.create(
                 "b12x.gemm.blockscaled._preparation:compile_packed",
-                TUNING.encode_query(query),
+                _compile_query_payload(query),
                 config.to_dict(),
                 None if p is None else p.to_dict(),
                 None if short is None else short.to_dict(),
@@ -664,7 +673,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         config = selection.config
         p, short = inner(config, device)
         programs = compile_packed(
-            TUNING.encode_query(query),
+            _compile_query_payload(query),
             config.to_dict(),
             None if p is None else p.to_dict(),
             None if short is None else short.to_dict(),

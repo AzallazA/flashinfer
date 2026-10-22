@@ -12,7 +12,13 @@ from b12x._lib.program_cache import program_cache
 from b12x._lib.compiler import run_compiled
 from b12x._lib.utils.device import current_cuda_stream
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
-from ._tuning import HyperConnectionConfig, HyperConnectionQuery, TUNING
+from b12x.preparation._efficiency import capture_autotune_effort
+from ._tuning import (
+    HyperConnectionConfig,
+    HyperConnectionQuery,
+    TUNING,
+    _uses_triton_reduction,
+)
 
 
 def _decode_query(payload):
@@ -22,8 +28,20 @@ def _decode_query(payload):
     return HyperConnectionQuery(**values)
 
 
-@program_cache(scope="preparation")
 def compile_hyperconnection(query_payload, config_payload, ordinal):
+    return _compile_hyperconnection(
+        _program_query_payload(query_payload), config_payload, ordinal
+    )
+
+
+def _program_query_payload(query_payload):
+    return {
+        key: value for key, value in query_payload.items() if key != "autotune_effort"
+    }
+
+
+@program_cache(scope="preparation")
+def _compile_hyperconnection(query_payload, config_payload, ordinal):
     """Return the exact production programs without allocating tensor storage."""
     from . import _cute as native
     from . import _kernels as kernels
@@ -32,13 +50,7 @@ def compile_hyperconnection(query_payload, config_payload, ordinal):
     config = HyperConnectionConfig.from_config(FrozenMapping(config_payload))
     role, streams, hidden = query.operation, query.streams, query.hidden_size
     device = torch.device("cuda", ordinal)
-    if (
-        role == "grouped_rmsnorm"
-        and not query.zero_centered
-        and not query.add_residual
-        and not query.paired
-        and query.dtype == query.output_dtype == "bfloat16"
-    ):
+    if role == "grouped_rmsnorm" and not _uses_triton_reduction(query):
         weight_dtype = getattr(torch, query.weight_dtype)
         return native._compile(
             ("rmsnorm", ordinal, streams, hidden, str(weight_dtype)),
@@ -186,13 +198,7 @@ def _launcher(query, config, compiled):
     from . import _kernels as kernels
 
     role = query.operation
-    if role == "grouped_rmsnorm" and (
-        query.zero_centered
-        or query.add_residual
-        or query.paired
-        or query.dtype == "float32"
-        or query.output_dtype == "float32"
-    ):
+    if _uses_triton_reduction(query):
 
         def invoke(state, weight, output, *, eps=None, residual=None, paired=None):
             kernels._norm_launch(
@@ -300,6 +306,7 @@ def plan_hyperconnection(caps, *, invocation=FrozenMapping(), override=None):
         hidden_size=caps.hidden_size,
         streams=caps.streams,
         lowrank=caps.lowrank,
+        autotune_effort=capture_autotune_effort().value,
         **options,
     )
     return Plan(
@@ -311,8 +318,8 @@ def plan_hyperconnection(caps, *, invocation=FrozenMapping(), override=None):
         _device=caps.device,
         _compile_jobs=lambda config, device: (
             CompileJob.create(
-                "b12x.norm.hyperconnection._preparation:compile_hyperconnection",
-                TUNING.encode_query(query),
+                "b12x.norm.hyperconnection._preparation:_compile_hyperconnection",
+                _program_query_payload(TUNING.encode_query(query)),
                 config.to_dict(),
                 device.ordinal,
             ),

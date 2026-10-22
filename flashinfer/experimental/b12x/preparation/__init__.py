@@ -1,5 +1,6 @@
 """Declarative configuration and session-prepared plans."""
 
+from ._efficiency import AutotuneEffort, autotune_effort
 from .device import DetectedDevice, detect_device
 from .session import CollectiveBarrierTimeout, PreparationJob, PreparationSession
 from .session import prepare_default
@@ -36,6 +37,8 @@ from .types import (
 
 __all__ = [
     "prepare_default",
+    "AutotuneEffort",
+    "autotune_effort",
     "BackendConfig",
     "CollectiveBarrierTimeout",
     "CollectiveRequirement",

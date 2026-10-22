@@ -11,7 +11,12 @@ import b12x._lib.dense_gemm.policy as _module__lib_dense_gemm_policy
 
 from dataclasses import asdict, dataclass, field, fields
 
-from b12x.preparation._efficiency import capture_exhaustive_search
+from b12x.preparation._efficiency import (
+    AutotuneEffort,
+    EfficiencyPredicate,
+    capture_autotune_effort,
+    capture_exhaustive_search,
+)
 
 from b12x.preparation import FrozenMapping
 from b12x.preparation.tuning import (
@@ -55,8 +60,12 @@ class DenseGemmQuery:
     workspace_form: str = "owned"
     sfb_k_replicated: bool = False
     exhaustive: bool = field(default_factory=capture_exhaustive_search)
+    autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     def __post_init__(self):
+        object.__setattr__(
+            self, "autotune_effort", AutotuneEffort(self.autotune_effort).value
+        )
         object.__setattr__(self, "overrides", FrozenMapping(self.overrides))
         object.__setattr__(
             self,
@@ -430,8 +439,6 @@ def knob_values(query):
 
 
 def validate_config(query, config, device):
-    from b12x._lib import dense_gemm as dense
-
     if not isinstance(config, DenseGemmConfig):
         raise ValueError("dense GEMM requires a typed launch config")
     for name, values in knob_values(query).items():
@@ -477,7 +484,10 @@ def validate_config(query, config, device):
             config.tile_m * config.tile_n * 2,
         )
         minimum_smem = 1024 + sum((size + 1023) // 1024 * 1024 for size in sizes)
-        if minimum_smem > dense.utils.get_smem_capacity_in_bytes("sm_120"):
+        capacity = _module__lib_dense_gemm_kernel.utils.get_smem_capacity_in_bytes(
+            "sm_120"
+        )
+        if minimum_smem > capacity:
             raise ValueError(
                 f"dense GEMM requires at least {minimum_smem} shared-memory bytes"
             )
@@ -631,18 +641,37 @@ def _parameters(query, device):
         row_tile = p["tile_n"] if p["swap_ab"] else p["tile_m"]
         return query.recipe != "mxfp8" or query.max_rows <= 128 or row_tile >= 32
 
+    def low_geometry(p):
+        return (
+            (
+                not p["swap_ab"]
+                or query.recipe in ("nvfp4", "mxfp4")
+                or query.out_features <= 512
+            )
+            and p["load_path"] == "tma"
+            and p["tile_k"] != 512
+            and p["target_occupancy"] in (None, 1)
+            and (
+                p["large_m_unroll"] in (None, False)
+                or query.expected_m is None
+                or query.expected_m > 128
+            )
+        )
+
     return ParameterSpace.create(
         TUNING.knobs,
         values=values,
         exhaustive=query.exhaustive,
+        autotune_effort=query.autotune_effort,
         efficiency_predicates=()
         if query.overrides or query.batch != 1
         else (
+            EfficiencyPredicate(low_geometry, minimum_effort="medium"),
             short_unswapped_async,
-            bounded_row_padding,
-            narrow_output_swap,
+            EfficiencyPredicate(bounded_row_padding, minimum_effort="high"),
+            EfficiencyPredicate(narrow_output_swap, minimum_effort="high"),
             bounded_prefill_k_tile,
-            reuse_rows,
+            EfficiencyPredicate(reuse_rows, minimum_effort="high"),
         ),
     )
 

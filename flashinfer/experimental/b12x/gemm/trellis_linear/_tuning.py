@@ -1,8 +1,9 @@
 """Host launch contract for Trellis linear."""
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 
-from b12x.preparation import Knob, ParameterBinding, TuningContract
+from b12x.preparation import Knob, ParameterBinding, ParameterSpace, TuningContract
+from b12x.preparation._efficiency import AutotuneEffort, capture_autotune_effort
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -27,6 +28,12 @@ class TrellisQuery:
     rotated_compute_provided: bool = False
     gemm_output_f16_provided: bool = False
     output_f16_provided: bool = False
+    autotune_effort: str = field(default_factory=capture_autotune_effort)
+
+    def __post_init__(self):
+        object.__setattr__(
+            self, "autotune_effort", AutotuneEffort(self.autotune_effort).value
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -101,9 +108,29 @@ def validate_query(query):
         )
 
 
+def _shared_memory_bytes(query, config):
+    """Size the native dense allocation used by W4A16GemmKernel."""
+    from b12x.moe._shared.kernels.w4a16.kernel.config import _reduction_shared_bytes
+
+    stages = 4
+    rows = ((config.block_rows + 15) // 16) * 16
+    bits = 4 if query.rate_axis == "k" else query.bits
+    weights = stages * config.tile_k * config.tile_n * bits // 8
+    reduction = rows * (2 * config.tile_n + 16)
+    bias = config.tile_n * 2
+    weight_reduction = max(max(weights, reduction), min(weights, reduction) + bias)
+    scales = stages * (config.tile_k // 32) * config.tile_n
+    activations = stages * rows * config.tile_k * 2
+    metadata = config.block_rows * 16
+    return max(
+        metadata + weight_reduction + scales + activations,
+        metadata
+        + _reduction_shared_bytes(config.tile_n, config.tile_k, config.block_rows == 8),
+    )
+
+
 def validate_config(query, config, device):
     from b12x.moe._shared.kernels.w4a16.kernel.config import (
-        _candidate_tile_fits,
         _w4a16_num_regs,
     )
 
@@ -120,17 +147,10 @@ def validate_config(query, config, device):
     threads = config.tile_n * config.tile_k // 64
     if threads not in (128, 256):
         raise ValueError("Trellis requires 128 or 256 CTA threads")
-    if not _candidate_tile_fits(
-        problem_n=query.out_features,
-        problem_k=query.in_features,
-        cta_m_blocks=(config.block_rows + 15) // 16,
-        tile_n=config.tile_n,
-        tile_k=config.tile_k,
-        cta_threads=threads,
-        max_shared_mem=101_376 - 512,
-        scale_format="e4m3_k32",
-        weight_layout="trellis_t256",
-        weight_bits=max(4, query.bits),
+    if (
+        query.out_features % config.tile_n
+        or query.in_features % config.tile_k
+        or _shared_memory_bytes(query, config) > 101_376 - 512
     ):
         raise ValueError("native Trellis tile exceeds shape or shared-memory limits")
     _w4a16_num_regs(
@@ -156,6 +176,8 @@ def default_config(query, device):
         size_n=query.out_features,
         sms=device.sm_count,
     )
+    if query.rate_axis == "n":
+        tile_n = 256
     return TrellisConfig(
         backend="cutedsl", block_rows=block_rows, tile_k=tile_k, tile_n=tile_n
     )
@@ -177,14 +199,18 @@ def launch_options(query, config):
 def _tuning_parameters(query, device):
     # These axes are the native override domain; validate_config checks the
     # interdependent CTA-thread, register, shared-memory and packed-layout constraints.
-    return {
-        "tile_n": (256,) if query.weight_layout.endswith("_n") else (64, 128, 256),
-    }
+    return ParameterSpace.create(
+        TUNING.knobs,
+        values={
+            "tile_n": (256,) if query.weight_layout.endswith("_n") else (64, 128, 256),
+        },
+        autotune_effort=query.autotune_effort,
+    )
 
 
 TUNING = TuningContract(
     component_id="gemm.trellis_linear",
-    query_schema_version=22,
+    query_schema_version=23,
     config_schema_version=22,
     semantic_version=1,
     query_fields=frozenset(field.name for field in fields(TrellisQuery)),
@@ -195,7 +221,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_config,
     default_config=default_config,
-    candidate_contract_version=2,
+    candidate_contract_version=3,
     knobs=(
         Knob(name="backend", values=("cutedsl",), binding=ParameterBinding.COMPILE),
         Knob(

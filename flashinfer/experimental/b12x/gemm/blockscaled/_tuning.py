@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from b12x._lib.quant.block_codec import BLOCK_CODECS, block_codec
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 
 from b12x.preparation import BackendConfig, FrozenMapping, make_fixed_contract
+from b12x.preparation._efficiency import (
+    AutotuneEffort,
+    EfficiencyPredicate,
+    capture_autotune_effort,
+)
 from b12x.preparation.tuning import (
     Knob,
     ParameterBinding,
@@ -33,8 +38,12 @@ class BlockscaledQuery:
     workspace_nbytes: int | None = None
     expected_m: int | None = None
     codegen: FrozenMapping | None = None
+    autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     def __post_init__(self):
+        object.__setattr__(
+            self, "autotune_effort", AutotuneEffort(self.autotune_effort).value
+        )
         if self.global_scale_kind is None:
             object.__setattr__(
                 self,
@@ -401,25 +410,18 @@ def _validate_config(query, config, device):
 
 
 def _tuning_parameters(query, device):
-    del device
-
     def eligible(parameters):
         if parameters["mode"] != "a16":
             return True
         if parameters["tile_n"] == 4:
             return (
                 query.recipe in BLOCK_CODECS
-                and query.num_tokens <= 8
                 and parameters["tile_m"] in (1, 2, 4, 8)
                 and parameters["tile_k"] == 256
                 and parameters["split_k"] == 1
             )
         if parameters["tile_m"] == 8:
-            return (
-                query.recipe in BLOCK_CODECS
-                and parameters["split_k"] == 1
-                and (parameters["tile_n"] == 64 or query.out_features > 64)
-            )
+            return query.recipe in BLOCK_CODECS and parameters["split_k"] == 1
         return (
             parameters["tile_m"] in (16, 32, 64)
             and parameters["tile_k"]
@@ -428,12 +430,31 @@ def _tuning_parameters(query, device):
                 if query.recipe in ("iq2_xs", "iq2_xxs", "q8_0", "nvfp4")
                 else (64, 128)
             )
-            and (
-                parameters["tile_m"] == 16
-                or query.recipe != "mxfp8"
-                and parameters["tile_m"] <= query.num_tokens
+            and (parameters["tile_m"] == 16 or query.recipe != "mxfp8")
+        )
+
+    def row_padding(parameters):
+        return (
+            parameters["mode"] != "a16"
+            or parameters["tile_m"] <= max(16, query.num_tokens)
+            or (
+                query.recipe == "nvfp4"
+                and parameters["tile_m"] == 32
+                and query.num_tokens > 16
+                and device is not None
+                and (query.out_features + 127) // 128 >= device.sm_count / 2
             )
-            and (parameters["tile_n"] == 64 or query.out_features > 64)
+        )
+
+    def narrow_output(parameters):
+        return (
+            parameters["mode"] != "a16"
+            or parameters["tile_n"] != 128
+            or query.out_features > 64
+            or query.recipe == "nvfp4"
+            or (query.recipe == "mxfp8" and _automatic_a16(query, device))
+            or (query.recipe in BLOCK_CODECS and query.num_tokens > 16)
+            or (query.recipe == "q8_0" and query.out_features >= query.in_features)
         )
 
     return ParameterSpace.create(
@@ -449,6 +470,19 @@ def _tuning_parameters(query, device):
             "mma_warps": (2, 4) if query.recipe == "mxfp8" else (None,),
         },
         predicates=(eligible,),
+        autotune_effort=query.autotune_effort,
+        efficiency_predicates=(
+            EfficiencyPredicate(row_padding, minimum_effort="high"),
+            EfficiencyPredicate(narrow_output, minimum_effort="high"),
+            EfficiencyPredicate(
+                lambda parameters: (
+                    parameters["mode"] != "a16"
+                    or parameters["tile_n"] != 4
+                    or query.num_tokens <= 8
+                ),
+                minimum_effort="max",
+            ),
+        ),
     )
 
 
@@ -468,7 +502,7 @@ def _equivalence(query, device, config):
 
 TUNING = TuningContract(
     component_id="gemm.blockscaled_precision",
-    query_schema_version=22,
+    query_schema_version=23,
     config_schema_version=23,
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
@@ -480,7 +514,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate_config,
     default_config=_default_config,
-    candidate_contract_version=21,
+    candidate_contract_version=22,
     knobs=(
         Knob(
             name="mode", values=("a16", "quantized"), binding=ParameterBinding.COMPILE

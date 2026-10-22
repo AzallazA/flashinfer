@@ -10,6 +10,7 @@ from enum import Enum
 from typing import Generic, TypeVar
 
 from .types import DeviceIdentity, FrozenMapping
+from ._efficiency import AutotuneEffort, EfficiencyPredicate
 
 QueryT = TypeVar("QueryT")
 ConfigT = TypeVar("ConfigT")
@@ -69,14 +70,15 @@ class Knob:
 class ParameterSpace:
     """Finite axes with correctness and optional efficiency predicates.
 
-    ``predicates`` always apply. ``efficiency_predicates`` only prune the search
-    when ``exhaustive`` is false; components capture that policy in their query.
+    ``predicates`` always apply. Performance filters are lifted at their declared
+    autotune effort; ``exhaustive=True`` selects the max effort.
     """
 
     knobs: tuple[Knob, ...]
     predicates: tuple[Callable[[Mapping[str, object]], bool], ...] = ()
     efficiency_predicates: tuple[Callable[[Mapping[str, object]], bool], ...] = ()
     exhaustive: bool = False
+    autotune_effort: AutotuneEffort | str = AutotuneEffort.MEDIUM
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "knobs", tuple(self.knobs))
@@ -86,6 +88,9 @@ class ParameterSpace:
         )
         if type(self.exhaustive) is not bool:
             raise TypeError("exhaustive must be a boolean")
+        object.__setattr__(
+            self, "autotune_effort", AutotuneEffort(self.autotune_effort)
+        )
         names = set()
         for knob in self.knobs:
             if knob.name in names or set(knob.when) - names:
@@ -111,6 +116,7 @@ class ParameterSpace:
         predicates: Iterable[Callable[[Mapping[str, object]], bool]] = (),
         efficiency_predicates: Iterable[Callable[[Mapping[str, object]], bool]] = (),
         exhaustive: bool = False,
+        autotune_effort: AutotuneEffort | str = AutotuneEffort.MEDIUM,
     ) -> ParameterSpace:
         """Resolve planner ranges while preserving the declared binding times."""
         knobs = tuple(knobs)
@@ -126,14 +132,26 @@ class ParameterSpace:
             predicates=tuple(predicates),
             efficiency_predicates=tuple(efficiency_predicates),
             exhaustive=exhaustive,
+            autotune_effort=autotune_effort,
         )
 
     def _passes_predicates(self, assignment: Mapping[str, object]) -> bool:
         # Predicates must not mutate or retain the enumeration's working mapping.
         # An exception is a planner defect, not a reason to silently drop a choice.
-        return all(predicate(assignment) for predicate in self.predicates) and (
-            self.exhaustive
-            or all(predicate(assignment) for predicate in self.efficiency_predicates)
+        return all(
+            predicate(assignment) for predicate in self.predicates
+        ) and self._passes_efficiency(assignment)
+
+    def _passes_efficiency(self, assignment: Mapping[str, object]) -> bool:
+        level = AutotuneEffort.MAX if self.exhaustive else self.autotune_effort
+        return all(
+            predicate(assignment)
+            for predicate in self.efficiency_predicates
+            if (
+                predicate.applies(level)
+                if isinstance(predicate, EfficiencyPredicate)
+                else level is not AutotuneEffort.MAX
+            )
         )
 
     def validate(self, assignment: Mapping[str, object]) -> None:
@@ -149,9 +167,7 @@ class ParameterSpace:
                 )
         if not all(predicate(assignment) for predicate in self.predicates):
             raise ValueError("assignment fails the plan's correctness predicates")
-        if not self.exhaustive and not all(
-            predicate(assignment) for predicate in self.efficiency_predicates
-        ):
+        if not self._passes_efficiency(assignment):
             raise ValueError("assignment fails the plan's efficiency predicates")
 
     def _product(
@@ -362,13 +378,20 @@ class CandidateIterator:
     def step(self):
         if self.done:
             raise StopIteration
+        cfg = self.configuration
+        heuristic_only = (
+            cfg.space.autotune_effort is AutotuneEffort.OFF and not cfg.space.exhaustive
+        )
         try:
             raw = next(self._product)
         except StopIteration:
             self.done = True
+            if heuristic_only:
+                raise ValueError(
+                    f"heuristic default is excluded by {cfg.contract.component_id} parameter space"
+                ) from None
             raise
         self.cartesian_count += 1
-        cfg = self.configuration
         if not cfg.space._passes_predicates(raw):
             return None
         assignment = FrozenMapping(raw)
@@ -376,6 +399,10 @@ class CandidateIterator:
             config = cfg.contract._lower(cfg.query, cfg.device, assignment)
         except ValueError:
             return None
+        if heuristic_only:
+            if config != cfg.default:
+                return None
+            self.done = True
         self.legal_count += 1
         effective = (
             cfg.contract.config_payload(config)

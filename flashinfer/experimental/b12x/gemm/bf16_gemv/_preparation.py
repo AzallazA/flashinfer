@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from b12x._lib.compile_plan import attach_programs, load_programs
@@ -148,6 +148,7 @@ def plan(query: GemvQuery, *, invocation=FrozenMapping(), override=None) -> Plan
     invocation = FrozenMapping(invocation)
     if invocation:
         raise ValueError("projection invocation semantics belong in GemvQuery")
+    compile_query = TUNING.encode_query(replace(query, autotune_effort="medium"))
 
     def compile_jobs(config, device):
         if config.backend == "torch":
@@ -155,7 +156,7 @@ def plan(query: GemvQuery, *, invocation=FrozenMapping(), override=None) -> Plan
         return (
             CompileJob.create(
                 "b12x.gemm.bf16_gemv._preparation:compile_gemv",
-                TUNING.encode_query(query),
+                compile_query,
                 TUNING.encode_config(config),
                 device.ordinal,
             ),
@@ -171,7 +172,7 @@ def plan(query: GemvQuery, *, invocation=FrozenMapping(), override=None) -> Plan
                 query, torch.device("cuda", device.ordinal), _torch_projection
             )
         programs = compile_gemv(
-            TUNING.encode_query(query),
+            compile_query,
             TUNING.encode_config(selection.config),
             device.ordinal,
         )

@@ -6,6 +6,8 @@ from b12x._lib.quant.block_codec import BLOCK_CODECS, block_codec
 
 from dataclasses import dataclass, replace
 
+from b12x.preparation._efficiency import AutotuneEffort, EfficiencyPredicate
+
 from b12x.preparation import (
     DeviceIdentity,
     FrozenMapping,
@@ -52,10 +54,12 @@ class MoeDecodeQuery:
     csf_inline_scales: bool = False
     swiglu_clamp_after_silu: bool = False
     a4_prefill: bool | None = None
+    autotune_effort: str = "medium"
 
     def to_dict(self) -> dict[str, object]:
         return {
             "a4_prefill": self.a4_prefill,
+            "autotune_effort": self.autotune_effort,
             "activation": self.activation,
             "apply_router_weight_on_input": self.apply_router_weight_on_input,
             "collect_activation_amax": self.collect_activation_amax,
@@ -275,6 +279,7 @@ def _validate_block_moe_launch(query, config):
 def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> None:
     if not isinstance(query, MoeDecodeQuery):
         raise TypeError("query must be MoeDecodeQuery")
+    AutotuneEffort(query.autotune_effort)
     if not isinstance(query.controls, FrozenMapping):
         raise TypeError("MoE controls must be frozen declaration metadata")
     if query.a4_prefill is not None and type(query.a4_prefill) is not bool:
@@ -697,15 +702,6 @@ def _materialize_tuning(query, device, choice):
     config = MoeDecodeConfig.from_config(choice)
     validate_moe_decode_config(query, config, device)
     if (
-        config.csf_inline_scales
-        and config.backend == "dynamic"
-        and query.routed_rows > query.num_experts * config.dynamic_tile_m
-    ):
-        raise ValueError(
-            "Inline scale tuning requires at most one full token tile per expert "
-            "on average"
-        )
-    if (
         min(
             query.num_experts,
             query.hidden_size,
@@ -766,7 +762,7 @@ def _materialize_tuning(query, device, choice):
     return config
 
 
-def _tuning_parameters(query, device):
+def _launch_parameter_space(query, device):
     if device is None or device.sm_count <= 0:
         raise ValueError("MoE launch tuning requires the device SM count")
     if query.source_format in BLOCK_CODECS:
@@ -850,6 +846,38 @@ def _tuning_parameters(query, device):
         }
     )
     return {"max_active_clusters": (None, *ladder)}
+
+
+def _tuning_parameters(query, device):
+    space = _launch_parameter_space(query, device)
+    if not isinstance(space, ParameterSpace):
+        space = ParameterSpace.create(TUNING.knobs, values=space)
+    grid_knob = next(k for k in space.knobs if k.name == "max_active_clusters")
+    sparse_grids = frozenset(grid_knob.values)
+    limit = max((v for v in sparse_grids if v is not None), default=0)
+    grids = (None, *range(1, limit + 1))
+    return ParameterSpace.create(
+        space.knobs,
+        values={"max_active_clusters": grids},
+        predicates=space.predicates,
+        efficiency_predicates=(
+            EfficiencyPredicate(
+                lambda p: p["max_active_clusters"] in sparse_grids,
+                minimum_effort="max",
+            ),
+            EfficiencyPredicate(
+                lambda p: (
+                    not (
+                        p["csf_inline_scales"]
+                        and p["backend"] == "dynamic"
+                        and query.routed_rows > query.num_experts * p["dynamic_tile_m"]
+                    )
+                ),
+                minimum_effort="high",
+            ),
+        ),
+        autotune_effort=query.autotune_effort,
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -939,7 +967,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 
 TUNING = TuningContract(
     component_id="moe.decode",
-    query_schema_version=32,
+    query_schema_version=33,
     config_schema_version=26,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
@@ -949,7 +977,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=34,
+    candidate_contract_version=35,
     knobs=(
         Knob(
             name="backend",
