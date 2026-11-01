@@ -211,6 +211,65 @@ from 1 KiB through 8 MiB at 16 points per doubling. Each size recommends one
 confirmed full configuration, including compiled geometry and runtime profile.
 This tool does not change serving dispatch or preparation defaults.
 
+For column all-gather, pass `--operation all_gather --row-bytes BYTES`. Sizes
+count input bytes per rank and must contain complete rows. Automatic size
+ladders align their points to that row width. The collector supports TP2/TP4/TP8
+and uses exact row-major, rank-interleaved output checks.
+
+`--gather-kernel runtime` measures device-selected CTA counts in fixed-protocol
+kernels and a joint barrier/word-exchange kernel. The joint kernel supports
+TP2/TP4 payloads through 16 KiB per rank; larger payloads use barrier gather.
+It launches a fixed physical grid and thread count, with protocol and active
+CTA count read from one uint32 selector. Word exchange uses one warp per CTA;
+barrier gather uses the full CTA. Wide CTAs use predicated first-packet loads
+to overlap selector and payload fetches without reconverging before dispatch.
+Both protocols use the established channel's
+separate receive regions and counters. All ranks must execute the same profile
+and serialize calls sharing that channel.
+
+`--gather-kernel static` measures the separate kernels with host-selected grids.
+`--gather-kernel compare` includes both static and runtime candidates under the
+same timing protocol. These flags affect only all-gather collection. DCP plans
+with `gather_transport` set to `joint`, `selected_barrier`, or
+`selected_word_exchange` compile a fixed geometry and retain a device selector.
+Explicit profiles passed to `joint_startup_spec` use the shared captured startup
+tuner. Ordinary DCP plans retain their preparation-time selection policy.
+
+```sh
+torchrun --standalone --nproc-per-node=4 -m b12x.tools.collective_ladder \
+  --operation all_gather --row-bytes 128 --gather-kernel runtime \
+  --min-bytes 128 --max-bytes 8MiB --budget-seconds 600 \
+  --output gather-switched.jsonl --fresh
+
+python -m b12x.tools.collective_ladder recommend-gather \
+  --switched gather-switched.jsonl --host gather-host.jsonl \
+  --output gather-recommendations.json
+```
+
+`--gather-proposal PATH` restricts collection to the geometries and profiles in a
+recommendation JSON. Each bucket can also contain a `references` list of full
+configuration objects (`implementation`, `threads`, `blocks`, `submode`, and
+`active_blocks`) for balanced comparisons. Configurations must satisfy the
+kernel's protocol and grid limits; a supplied control may include idle CTAs.
+Use `--gather-capacity-bytes BYTES` when measuring a subset
+of sizes to preserve the full sweep's channel capacity. `--rounds 17` enforces
+at least 102 individual rank-maximum timings per measured candidate.
+
+Run collection separately for each topology and row width. Each input report must have complete results. Reports from the same devices,
+row width, channel capacity, and timing conditions are pooled before matching
+payload coverage between topology cohorts. Different machines remain separate
+cohorts. The merger produces `min_bytes` and one `buckets` list shared across
+all measured row widths. It chooses one compiled geometry
+per byte size, minimizing worst host cost among choices within 2% of the fastest
+runtime kernel on every switched report. `--switched-margin` sets that margin
+through 5%. If no shared geometry meets it, switched cost takes priority. The
+result retains the smallest measured profile menu that stays within the
+switched margin and within 5% of that geometry's best profile on each host
+cohort. If the compiled geometry cannot meet the switched margin, its fastest
+measured switched profiles are retained. Reported regret includes static baselines when supplied
+through comparison reports. The output describes measured recommendations;
+it does not install a serving ladder.
+
 Search covers every compiled geometry and submode at every size, then refines
 runtime profiles using neighboring measurements. Screening rounds scale inversely
 with payload bytes, up to eight rounds by default. Up to eight candidates within
