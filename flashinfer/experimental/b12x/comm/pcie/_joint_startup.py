@@ -30,8 +30,11 @@ class JointStartupSpec:
 def joint_startup_spec(plan, *, profiles=None):
     """Describe supplied runtime profiles or measured finalists of a prepared launcher."""
     from ._joint_preparation import _JointExecutionState
+    from ._gather_preparation import SelectedGatherState, startup_spec
 
     prepared = plan.prepared
+    if prepared is not None and isinstance(prepared.state, SelectedGatherState):
+        return startup_spec(plan, profiles)
     if prepared is None or not isinstance(prepared.state, _JointExecutionState):
         raise ValueError("startup tuning requires a prepared joint collective")
     state = prepared.state
@@ -101,6 +104,7 @@ class JointStartupTuner:
 
     def __init__(self, specs, cache_policy):
         from ._benchmark import _ReductionInputs
+        from ._gather_preparation import GatherInputs, SelectedGatherState
         from ._joint_startup_cute import SCRATCH_BYTES, SIGNAL_BYTES, timing_launcher
         from .pcie_oneshot import (
             PCIeOneshotAllReduce,
@@ -128,6 +132,7 @@ class JointStartupTuner:
             raise ValueError("cache_policy must be cold or warm")
         self.key = first.key
         self.state, self.runtime = state, runtime
+        self.gather = isinstance(state, SelectedGatherState)
         self.cache_policy = cache_policy
         _require_collective_contract(
             owner="joint startup tuner",
@@ -151,8 +156,17 @@ class JointStartupTuner:
                     dtype=torch.uint32,
                     device=runtime.device,
                 )
-                self.inputs = _ReductionInputs(state, inplace=first.inplace)
-                self.mismatch = torch.empty_like(self.inputs.out, dtype=torch.bool)
+                self.inputs = (
+                    GatherInputs(state)
+                    if self.gather
+                    else _ReductionInputs(state, inplace=first.inplace)
+                )
+                self.checked_output = (
+                    self.inputs.out.view(torch.uint8).reshape(-1)
+                    if self.gather
+                    else self.inputs.out
+                )
+                self.mismatch = torch.empty_like(self.checked_output, dtype=torch.bool)
                 self.invalid = torch.zeros((), dtype=torch.int32, device=runtime.device)
                 self.eviction = self.eviction_sum = None
                 if cache_policy == "cold":
@@ -273,6 +287,9 @@ class JointStartupTuner:
         )
 
     def _collective(self):
+        if self.gather:
+            self.state.run_selected(self.inputs.source, self.inputs.out)
+            return
         work = self.state.workspace
         self.state.launcher(
             work.peer_table.data_ptr(),
@@ -295,7 +312,7 @@ class JointStartupTuner:
                     self.inputs.produce(producer)
                     self._collective()
                     torch.ne(
-                        self.inputs.out,
+                        self.checked_output,
                         self.inputs.reference.expected[producer],
                         out=self.mismatch,
                     )
@@ -334,6 +351,11 @@ def prepare_joint_startup_tuner(specs, *, cache_policy="cold"):
     if producer.status.item() != 0:
         raise RuntimeError("joint startup fixture validation failed during preparation")
     for spec in producer.specs:
+        from ._gather_preparation import SelectedGatherState
+
+        if isinstance(spec.state, SelectedGatherState):
+            spec.selector.fill_(spec.state.initial_profile)
+            continue
         call = spec.state.query.call
         spec.selector.fill_(
             selected_profile(

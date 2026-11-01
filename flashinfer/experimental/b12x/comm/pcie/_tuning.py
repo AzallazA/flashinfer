@@ -74,7 +74,11 @@ def _validate_query(query: PcieQuery, device) -> None:
         raise ValueError("rank must belong to the caller's process group")
     if query.surface.endswith(".all_gather_heads"):
         transport = query.call.get("gather_transport", "barrier")
-        if transport not in ("barrier", "word_exchange"):
+        from ._gather_preparation import GATHER_MODES, validate_query as validate_gather
+
+        if transport in GATHER_MODES:
+            validate_gather(query)
+        elif transport not in ("barrier", "word_exchange"):
             raise ValueError("unknown DCP gather transport")
         if transport == "word_exchange":
             from math import prod
@@ -110,6 +114,6 @@ def _validate_query(query: PcieQuery, device) -> None:
         )
 
 
-TUNING = replace(TUNING, query_schema_version=40, validate_query=_validate_query)
+TUNING = replace(TUNING, query_schema_version=41, validate_query=_validate_query)
 
 __all__ = ["PcieQuery", "PcieConfig", "SURFACES", "TUNING"]
