@@ -852,7 +852,6 @@ def _query_bf16_from_call(
     expected_m=None,
 ):
     from ._a16 import MXFP4LinearWeight, _weight_parts
-    from ._packed_nvfp4 import PackedNVFP4LinearWeight
     from ._iq2_xs import IQ2XSLinearWeight
 
     values, _, _, fp4 = _weight_parts(weight)
@@ -876,9 +875,7 @@ def _query_bf16_from_call(
             "packed workspace must be contiguous uint8 storage on the source device"
         )
     return BlockscaledQuery(
-        recipe="nvfp4_packed"
-        if isinstance(weight, PackedNVFP4LinearWeight)
-        else weight.codec
+        recipe=weight.codec
         if isinstance(weight, IQ2XSLinearWeight)
         else "mxfp4"
         if isinstance(weight, MXFP4LinearWeight)
@@ -1385,10 +1382,6 @@ def plan(query, *, invocation=FrozenMapping(), override=None):
     from ._tuning import FixedBlockscaledQuery
     from b12x.gemm._tuning import DenseGemmQuery
 
-    if isinstance(query, BlockscaledQuery) and query.recipe == "nvfp4_packed":
-        from ._packed_nvfp4 import plan as packed_plan
-
-        return packed_plan(query, invocation=invocation, override=override)
     if isinstance(query, BlockscaledQuery):
         return _plan_bf16(query, invocation=invocation, override=override)
     if isinstance(query, FixedBlockscaledQuery):
@@ -1534,19 +1527,12 @@ def query_from_call(
     **options,
 ):
     from ._a16 import MXFP4LinearWeight, NVFP4LinearWeight
-    from ._packed_nvfp4 import PackedNVFP4LinearWeight
     from ._iq2_xs import IQ2XSLinearWeight
     from ._linear import MXFP8LinearWeight, TensorFP8LinearWeight
     from ._tuning import FixedBlockscaledQuery
 
     if isinstance(
-        weight,
-        (
-            NVFP4LinearWeight,
-            PackedNVFP4LinearWeight,
-            MXFP4LinearWeight,
-            IQ2XSLinearWeight,
-        ),
+        weight, (NVFP4LinearWeight, MXFP4LinearWeight, IQ2XSLinearWeight)
     ) or (
         isinstance(weight, MXFP8LinearWeight)
         and isinstance(source, torch.Tensor)
