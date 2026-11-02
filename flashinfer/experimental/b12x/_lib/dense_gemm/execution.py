@@ -737,6 +737,7 @@ def dense_gemm(
                 and allow_bf16_atomic_reduction
             ),
             large_m_unroll=policy.large_m_unroll,
+            preserve_raster=policy.preserve_raster,
         )
     if _large_m_unroll_override is not None:
         if not is_mxfp8 or is_mxfp6 or l != 1:
@@ -752,6 +753,7 @@ def dense_gemm(
             split_k_slices=policy.split_k_slices,
             split_k_atomic_bf16=policy.split_k_atomic_bf16,
             large_m_unroll=_large_m_unroll_override,
+            preserve_raster=policy.preserve_raster,
         )
     split_k_slices = policy.split_k_slices
     if swap_ab and split_k_slices != 1:
@@ -762,6 +764,7 @@ def dense_gemm(
             split_k_slices=1,
             split_k_atomic_bf16=False,
             large_m_unroll=policy.large_m_unroll,
+            preserve_raster=policy.preserve_raster,
         )
         split_k_slices = 1
     if is_mxfp6 and (policy.split_k_slices != 1 or policy.large_m_unroll):
@@ -995,6 +998,7 @@ def dense_gemm(
             policy.split_k_slices,
             policy.split_k_atomic_bf16,
             policy.large_m_unroll,
+            policy.preserve_raster,
             load_path,
             swap_ab,
             sfb_k_reuse,
@@ -1104,6 +1108,7 @@ def dense_gemm(
             policy.split_k_slices,
             policy.split_k_atomic_bf16,
             policy.large_m_unroll,
+            policy.preserve_raster,
             load_path,
             swap_ab,
             sfb_k_reuse,

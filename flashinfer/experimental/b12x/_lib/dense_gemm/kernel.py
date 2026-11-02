@@ -139,6 +139,7 @@ class DenseGemmKernel:
         split_k_slices: int = 1,
         split_k_atomic_bf16: bool = False,
         large_m_unroll: bool = False,
+        preserve_raster: bool = False,
         use_m1_non_tma_a: bool = False,
         use_m1_non_tma_c: bool = False,
         use_m1_non_tma_sfa: bool = False,
@@ -330,6 +331,7 @@ class DenseGemmKernel:
         self.split_k_slices = split_k_slices
         self.split_k_atomic_bf16 = split_k_atomic_bf16
         self.large_m_unroll = large_m_unroll
+        self.preserve_raster = preserve_raster
         self.use_m1_non_tma_a = use_m1_non_tma_a
         self.use_m1_non_tma_c = use_m1_non_tma_c
         self.use_m1_non_tma_sfa = use_m1_non_tma_sfa
@@ -553,10 +555,18 @@ class DenseGemmKernel:
                 1,
             )
 
-        # MX-FP6 operands use Float8E4M3FN byte containers in global and
-        # shared memory. The explicit format is therefore the reliable policy
-        # discriminator; ``a_dtype`` alone also matches ordinary MXFP8.
-        if self.mxfp6_fmt_a is not None:
+        # Subtile the epilogue when it enables deeper blockscaled staging.
+        if (
+            self.mxfp6_fmt_a is not None
+            or (self.a_dtype == cutlass.Float4E2M1FN and not self.a16)
+            or (
+                self.a_dtype == cutlass.Float8E4M3FN
+                and self.sf_vec_size == 32
+                and not self.a16
+                and not self.plain_fp8
+                and self.tile_shape_mnk == (128, 128, 64)
+            )
+        ):
 
             def _probe_stages(epi_tile: tuple, epi_stage_cap: int) -> tuple:
                 return self._compute_stages(
@@ -572,7 +582,7 @@ class DenseGemmKernel:
                     self.occupancy,
                     self.b_packed,
                     epi_stage_cap,
-                    decode_stage3=True,
+                    decode_stage3=self.mxfp6_fmt_a is not None,
                 )
 
             self.epi_tile, epi_stage_cap = self._choose_epilogue(
@@ -878,6 +888,15 @@ class DenseGemmKernel:
             self.split_k_slices,
             self.large_m_unroll,
             self.a16,
+            self.a_dtype == cutlass.Float8E4M3FN
+            and self.sf_vec_size == 32
+            and self.mxfp6_fmt_a is None
+            and not self.a16
+            and not self.plain_fp8,
+            self.preserve_raster,
+            self.a_dtype == cutlass.Float4E2M1FN
+            and self.sf_vec_size == 16
+            and not self.a16,
         )
 
         @cute.struct
@@ -4444,7 +4463,7 @@ class DenseGemmKernel:
         probe,
         stages_through_smem: bool = True,
     ) -> tuple:
-        """Choose an MX-FP6 epilogue tile without reducing mainloop depth."""
+        """Choose an epilogue tile without reducing mainloop depth."""
         full = (mma_tiler_mn[0], mma_tiler_mn[1])
         if not stages_through_smem:
             # The m=1 epilogue stores straight out of registers rather than
@@ -4579,17 +4598,32 @@ class DenseGemmKernel:
         split_k_slices: int,
         large_m_unroll: bool,
         split_k_all_m: bool = False,
+        mxfp8: bool = False,
+        preserve_raster: bool = False,
+        native_nvfp4: bool = False,
     ) -> tuple:
         c_shape = cute.slice_(tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
         cluster_shape_mnl = (1, 1, 1)
+        swizzle_size = (
+            16
+            if tile_shape_mnk == (128, 128, 64)
+            and (not large_m_unroll or (mxfp8 and preserve_raster))
+            else 1
+        )
+        if mxfp8 and swizzle_size == 16 and num_ctas_mnl[1] % 16 == 8:
+            swizzle_size = 8
+        if cutlass.const_expr(
+            native_nvfp4
+            and tile_shape_mnk in ((128, 128, 128), (128, 128, 256))
+            and c.shape[1] % 1024 == 0
+        ):
+            swizzle_size = 8
         tile_sched_params = utils.PersistentTileSchedulerParams(
             num_ctas_mnl,
             cluster_shape_mnl,
-            swizzle_size=(
-                16 if tile_shape_mnk == (128, 128, 64) and not large_m_unroll else 1
-            ),
+            swizzle_size=swizzle_size,
         )
         if cutlass.const_expr(split_k_slices > 1 or split_k_all_m):
             grid = (
