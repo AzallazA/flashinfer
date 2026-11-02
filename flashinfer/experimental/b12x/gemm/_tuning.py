@@ -556,7 +556,7 @@ def validate_config(query, config, device):
         )
     if config.split_k_slices is not None and config.split_k_slices > 1:
         if (
-            query.max_rows > min(8, config.tile_m)
+            query.max_rows > min(16 if query.recipe == "mxfp8" else 8, config.tile_m)
             or query.batch != 1
             or config.swap_ab
             or query.in_features % (config.tile_k * config.split_k_slices)
@@ -736,7 +736,7 @@ TUNING = TuningContract(
     default_config=default_config,
     validate_query=_validate_query,
     validate_config=validate_config,
-    candidate_contract_version=18,
+    candidate_contract_version=19,
     knobs=(
         Knob(name="backend", values=("cutedsl",), binding=ParameterBinding.COMPILE),
         Knob(name="tile_m", values=(16, 32, 64, 128), binding=ParameterBinding.COMPILE),

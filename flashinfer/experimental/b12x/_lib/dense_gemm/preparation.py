@@ -554,9 +554,10 @@ def _lower_dense_gemm(
                 f"{_split_k_slices_override}"
             )
         if _split_k_slices_override > 1:
-            if m > 8 or m > mma_tiler_mn[0] or l != 1 or swap_ab:
+            row_limit = 16 if mxfp8_autotune else 8
+            if m > row_limit or m > mma_tiler_mn[0] or l != 1 or swap_ab:
                 raise ValueError(
-                    "split-K FP8 autotuning requires M<=8 within one M tile, "
+                    f"split-K FP8 autotuning requires M<={row_limit} within one M tile, "
                     f"L=1, and an unswapped plan; got M={m}, L={l}, "
                     f"tile={mma_tiler_mn}, swap_ab={swap_ab}"
                 )
