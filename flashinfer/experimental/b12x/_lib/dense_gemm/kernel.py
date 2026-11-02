@@ -460,7 +460,7 @@ class DenseGemmKernel:
         self.load_register_requirement = 40
         self.mma_register_requirement = 232
 
-    def _setup_attributes(self):
+    def _setup_attributes(self, reduction_extent):
         mma_sf_dtype = cutlass.Float8E8M0FNU if self.block_fp8 else self.sf_dtype
         if self.a16:
             mma_op = cute.nvgpu.warp.MmaF16BF16Op(
@@ -627,6 +627,11 @@ class DenseGemmKernel:
                 else:
                     raise ValueError("A16 tile cannot fit one shared-memory stage")
                 self.ab_stage, self.epi_stage = _probe_a16_stages()
+            if self.weight_only == "mxfp8":
+                k_tiles = cute.ceil_div(reduction_extent, self.tile_shape_mnk[2])
+                self.ab_stage = min(
+                    self.ab_stage, max(1, cute.ceil_div(k_tiles, self.split_k_slices))
+                )
         else:
             # Other families use the generic stage policy.
             self.ab_stage, self.epi_stage = self._compute_stages(
@@ -773,7 +778,7 @@ class DenseGemmKernel:
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
             raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
 
-        self._setup_attributes()
+        self._setup_attributes(cute.size(a.shape[1]))
 
         # Regular block-FP8 carries compact FP32 scales directly. Native MX
         # paths retain the MMA scale-factor atom layout.
