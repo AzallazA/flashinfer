@@ -87,6 +87,23 @@ def _short_dense_lowering(query, config, device):
     )
 
 
+def _pad_activation_scale_rows(query, lowering):
+    # Compact staging reads scale rows 0-15; inactive output rows are discarded.
+    return not (
+        query.recipe == "nvfp4"
+        and lowering is not None
+        and lowering.m <= 16
+        and lowering.mma_tiler_mn in ((16, 32), (16, 64))
+        and lowering.tile_k == 1024
+        and lowering.load_path == "tma"
+        and not lowering.swap_ab
+        and not lowering.fused_quant
+        and not lowering.direct_m1_wo_a_inputs
+        and not lowering.programmatic_serialization
+        and not lowering.quantize_c
+    )
+
+
 @program_cache(scope="preparation")
 def compile_packed(
     query_payload,
@@ -233,6 +250,12 @@ def compile_packed(
                 GROUP=group,
                 CHUNKS=16,
                 SWIGLU=config.fuse_swiglu,
+                PAD_SCALE_ROWS=_pad_activation_scale_rows(
+                    query,
+                    _module__lib_dense_gemm_preparation._DenseLowering.from_dict(
+                        dense_payload
+                    ),
+                ),
                 grid=(
                     query.num_tokens,
                     triton.cdiv(query.padded_in_features // group, 16),
@@ -258,10 +281,10 @@ def _mxfp8_bases_nbytes(query):
     return rows * k + rows * scale_columns + tiles * 32 * 4 * 4
 
 
-def _owned_bytes(query, config):
+def _owned_bytes(query, config, device=None):
     if query.workspace_form != "owned":
         return 0
-    owned = _workspace_bytes(query, config)
+    owned = _workspace_bytes(query, config, device)
     if functional_mxfp8_quantization(query, config):
         owned += _mxfp8_bases_nbytes(query)
     return owned
@@ -273,11 +296,13 @@ def _activation_bytes(query, config):
     return 0
 
 
-def _workspace_bytes(query, config):
-    return _activation_bytes(query, config) + _projection_workspace_bytes(query, config)
+def _workspace_bytes(query, config, device=None):
+    return _activation_bytes(query, config) + _projection_workspace_bytes(
+        query, config, device
+    )
 
 
-def _projection_workspace_bytes(query, config):
+def _projection_workspace_bytes(query, config, device):
     if config.mode == "a16":
         slices = effective_a16_config(query, config)[2]
         partials = (
@@ -287,28 +312,34 @@ def _projection_workspace_bytes(query, config):
             return max(partials, query.out_features * query.padded_in_features * 2)
         return partials
     if functional_mxfp8_quantization(query, config):
-        if config.dense_config is not None and not query.codegen["split_k_atomic"]:
-            slices = config.dense_config["split_k_slices"]
+        if not query.codegen["split_k_atomic"] or not query.allow_bf16_atomic_reduction:
+            slices = _quantized_workspace_slices(query, config, device)
             if slices > 1:
                 return slices * query.num_tokens * query.out_features * 4
         return 0
-    return _quantized_layout(query, config)[-1]
+    return _quantized_layout(query, config, device)[-1]
 
 
-def _quantized_layout(query, config):
+def _quantized_workspace_slices(query, config, device):
+    if config.dense_config is not None:
+        return config.dense_config["split_k_slices"] or 1
+    if query.codegen["split_k_atomic"] and query.allow_bf16_atomic_reduction:
+        return 1
+    from b12x.gemm._preparation import _default_lowering
+
+    inner = quantized_query(query, expected_m=quantized_expected_m(query))
+    return _default_lowering(inner, device).policy.split_k_slices
+
+
+def _quantized_layout(query, config, device):
     from ._a16 import _layout
 
-    slices = (
-        1
-        if config.dense_config is None
-        else (config.dense_config["split_k_slices"] or 1)
-    )
     return _layout(
         query.num_tokens,
         query.out_features,
         query.padded_in_features,
         query.recipe in ("nvfp4", "mxfp4"),
-        (64, 64, slices),
+        (64, 64, _quantized_workspace_slices(query, config, device)),
         group=16 if query.recipe == "nvfp4" else 32,
     )
 
@@ -602,6 +633,7 @@ class _PackedExecutionState:
                 group,
                 16,
                 config.fuse_swiglu,
+                _pad_activation_scale_rows(q, core.lowering),
             )
             grid = (m, triton.cdiv(q.padded_in_features // group, 16), 1)
             self.programs["quantize"][grid](
@@ -672,7 +704,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
     def memory(config, device):
         from b12x.preparation import current_plan, current_prepared_state
 
-        needed = _workspace_bytes(query, config)
+        needed = _workspace_bytes(query, config, device.identity)
         scratch = (
             (
                 scratch_buffer_spec(
@@ -685,7 +717,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
             else ()
         )
         persistent = []
-        owned = _owned_bytes(query, config)
+        owned = _owned_bytes(query, config, device.identity)
         if owned:
             existing = current_prepared_state()
             resident = 0 if existing is None else min(owned, existing.owned_nbytes)
@@ -764,9 +796,9 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         offsets = (
             None
             if config.mode == "a16" or functional_mxfp8_quantization(query, config)
-            else _quantized_layout(query, config)
+            else _quantized_layout(query, config, device.identity)
         )
-        needed = _workspace_bytes(query, config)
+        needed = _workspace_bytes(query, config, device.identity)
         workspace = bases = None
         if query.workspace_form == "owned":
             from b12x.preparation import current_prepared_state
@@ -844,6 +876,7 @@ def _query_bf16_from_call(
     source,
     weight,
     *,
+    allow_bf16_atomic_reduction=True,
     source_activation="identity",
     activation_mode="auto",
     activation_global_scale=None,
@@ -888,6 +921,7 @@ def _query_bf16_from_call(
         out_features=weight.out_features,
         activation_mode=activation_mode,
         source_activation=source_activation,
+        allow_bf16_atomic_reduction=allow_bf16_atomic_reduction,
         activation_scale_available=activation_global_scale is not None,
         global_scale_kind=weight.global_scale_kind if fp4 else "none",
         source_contiguous=source.is_contiguous(),
@@ -1538,6 +1572,7 @@ def query_from_call(
         and isinstance(source, torch.Tensor)
         and source.dtype == torch.bfloat16
     ):
+        allow_bf16_atomic_reduction = options.pop("allow_bf16_atomic_reduction", True)
         if options or alpha is not None or out_dtype not in (None, torch.bfloat16):
             raise ValueError("unsupported packed BF16 declaration options")
         return _query_bf16_from_call(
@@ -1545,6 +1580,7 @@ def query_from_call(
             weight,
             activation_mode=activation_mode,
             source_activation=source_activation,
+            allow_bf16_atomic_reduction=allow_bf16_atomic_reduction,
             activation_global_scale=activation_global_scale,
             out=out,
             workspace=workspace,

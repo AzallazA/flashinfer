@@ -14,10 +14,23 @@ from ._mxfp8_rows_fixture import rows_and_bases
 
 @pytest.mark.parametrize("rows", (9, 13, 15, 16))
 @pytest.mark.parametrize("atomic", (False, True))
-@pytest.mark.parametrize("tile_m", (16, 32, 64, 128))
-def test_wide_splitk_mutable_capture(rows, atomic, tile_m):
+@pytest.mark.parametrize(
+    "tile_m,tile_k",
+    ((16, 128), (32, 128), (64, 128), (128, 128), (16, 256), (32, 256), (64, 256)),
+)
+def test_wide_splitk_mutable_capture(
+    rows,
+    atomic,
+    tile_m,
+    tile_k,
+    *,
+    n=16384,
+    tile_n=64,
+    split_slices=4,
+    large_m_unroll=True,
+):
     device = require_b12x()
-    n, k = 16384, 5120
+    k = 5120
     torch.manual_seed(816 + rows)
     source = torch.randint(-2, 3, (rows, k), device=device).bfloat16()
     a, bases = rows_and_bases(rows, k, device=device)
@@ -27,7 +40,7 @@ def test_wide_splitk_mutable_capture(rows, atomic, tile_m):
     ).weight
     storage = torch.full((rows + 2, n, 1), 91, device=device, dtype=torch.bfloat16)
     output = storage[1:-1]
-    workspace = torch.empty(4 * rows * n, device=device, dtype=torch.float32)
+    workspace = torch.empty(split_slices * rows * n, device=device, dtype=torch.float32)
     quant = mxfp8.plan(
         mxfp8.query_from_call(source, a.values, a.scale_rows, a.scale_mma)
     )
@@ -49,12 +62,12 @@ def test_wide_splitk_mutable_capture(rows, atomic, tile_m):
     config = gemm.DenseGemmConfig(
         backend="cutedsl",
         tile_m=tile_m,
-        tile_n=64,
-        tile_k=128,
+        tile_n=tile_n,
+        tile_k=tile_k,
         load_path="tma",
         swap_ab=False,
-        split_k_slices=4,
-        large_m_unroll=True,
+        split_k_slices=split_slices,
+        large_m_unroll=large_m_unroll,
         target_occupancy=None,
     )
     plan = gemm.plan(query, override=config)
@@ -80,13 +93,14 @@ def test_wide_splitk_mutable_capture(rows, atomic, tile_m):
         if atomic:
             partials = [
                 (
-                    left[:, start : start + k // 4] @ right[:, start : start + k // 4].T
+                    left[:, start : start + k // split_slices]
+                    @ right[:, start : start + k // split_slices].T
                 ).bfloat16()
-                for start in range(0, k, k // 4)
+                for start in range(0, k, k // split_slices)
             ]
             distance = torch.full_like(actual.float(), float("inf"))
             reference = torch.zeros_like(actual)
-            for order in permutations(range(4)):
+            for order in permutations(range(split_slices)):
                 candidate = torch.zeros_like(actual)
                 for index in order:
                     candidate = (candidate.float() + partials[index].float()).bfloat16()
@@ -161,3 +175,20 @@ def test_wide_splitk_mutable_capture(rows, atomic, tile_m):
             check()
             assert torch.count_nonzero(output[live:]) == 0
         graph.reset()
+
+
+@pytest.mark.parametrize("rows", (1, 16))
+@pytest.mark.parametrize("split_slices", (2, 4))
+@pytest.mark.parametrize("atomic", (False, True))
+@pytest.mark.parametrize("large_m_unroll", (False, True))
+def test_splitk_nondivisible_raster_capture(rows, split_slices, atomic, large_m_unroll):
+    test_wide_splitk_mutable_capture(
+        rows,
+        atomic,
+        128,
+        64,
+        n=16480,
+        tile_n=128,
+        split_slices=split_slices,
+        large_m_unroll=large_m_unroll,
+    )

@@ -1013,13 +1013,15 @@ def test_native_weight_pairs_exhaustive(fp4):
     torch.testing.assert_close(out, expected, atol=0, rtol=0, equal_nan=True)
 
 
-@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize(
+    "recipe,tile_k", [("nvfp4", 128), ("mxfp8", 128), ("mxfp8", 256)]
+)
 @pytest.mark.parametrize("k", [32, 96, 160])
-def test_a16_short_scale_tile_tail(recipe, k):
+def test_a16_short_scale_tile_tail(recipe, tile_k, k):
     require_b12x()
     weight, decoded, _ = make_weight(recipe, 40, k)
     source = torch.randn(3, k, device="cuda", dtype=torch.bfloat16)
-    config = BlockscaledConfig(mode="a16", tile_n=128, tile_k=128, split_k=4)
+    config = BlockscaledConfig(mode="a16", tile_n=128, tile_k=tile_k, split_k=4)
     with prepared_execution(
         source,
         weight,
@@ -1030,19 +1032,41 @@ def test_a16_short_scale_tile_tail(recipe, k):
     assert_close(actual, source.float() @ decoded.T)
 
 
-@pytest.mark.parametrize("tile_m", [16, 32, 64])
-@pytest.mark.parametrize("tile_n", [64, 128])
+@pytest.mark.parametrize(
+    "recipe,tile_m,mma_warps,tile_n,tile_k",
+    [
+        (recipe, tile_m, warps, tile_n, 256)
+        for recipe, tile_m, warps in (
+            ("nvfp4", 16, None),
+            ("nvfp4", 32, None),
+            ("nvfp4", 64, None),
+            ("mxfp8", 16, 2),
+            ("mxfp8", 16, 4),
+        )
+        for tile_n in (64, 128)
+    ]
+    + [
+        ("mxfp8", 16, warps, 32, tile_k)
+        for warps in (2, 4)
+        for tile_k in (64, 128, 256)
+    ],
+)
 @pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("k", [768, 800])
-def test_nvfp4_k256_dynamic_graph_replay(tile_m, tile_n, split, k):
+def test_a16_dynamic_graph_replay(recipe, tile_m, mma_warps, tile_n, tile_k, split, k):
     require_b12x()
     from b12x.preparation import require_prepared
 
-    weight, decoded, _ = make_weight("nvfp4", 136, k)
+    weight, decoded, _ = make_weight(recipe, 136, k)
     source = torch.randn(65, k, device="cuda", dtype=torch.bfloat16)
     output = torch.empty(65, 136, device="cuda", dtype=torch.bfloat16)
     config = BlockscaledConfig(
-        mode="a16", tile_m=tile_m, tile_n=tile_n, tile_k=256, split_k=split
+        mode="a16",
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        split_k=split,
+        mma_warps=mma_warps,
     )
     workspace = make_workspace(
         source, weight, activation_mode="a16", out=output, config=config
@@ -1058,7 +1082,7 @@ def test_nvfp4_k256_dynamic_graph_replay(tile_m, tile_n, split, k):
         state = require_prepared(plan, "gemm.blockscaled_precision", source.device)
         program = state.programs["gemm"]
         pointers = (source.data_ptr(), output.data_ptr(), workspace.data_ptr())
-        with kernel_resolution_guard("NVFP4 K256 capacity replay"):
+        with kernel_resolution_guard("A16 capacity replay"):
             for m in (1, 3, 8, 17, 65):
                 x, y = source[:m], output[:m]
                 expected = x.float() @ decoded.T

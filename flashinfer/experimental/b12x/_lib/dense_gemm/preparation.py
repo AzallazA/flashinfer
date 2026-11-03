@@ -223,9 +223,16 @@ def _lower_dense_gemm(
                 raise ValueError(f"unsupported {name}={fmt!r}")
     else:
         raise TypeError(f"dense_gemm unsupported ab_dtype: {ab_dtype}")
+    if (
+        ab_dtype == "float4_e2m1fn"
+        and sf_vec_size == 16
+        and mma_tiler_mn in ((16, 32), (16, 64))
+        and m > 16
+    ):
+        raise ValueError("native FP4 M16 tiles require M<=16")
     if _tile_k_override is not None:
         if ab_dtype == "float4_e2m1fn":
-            valid_tile_k = (128, 256, 512)
+            valid_tile_k = (128, 256, 512, 1024)
             format_name = "NVFP4"
         elif (
             ab_dtype == "float8_e4m3fn"
@@ -234,7 +241,7 @@ def _lower_dense_gemm(
             and sf_dtype == "float8_e8m0fnu"
             and sf_vec_size == 32
         ):
-            valid_tile_k = (64, 128)
+            valid_tile_k = (64, 128, 256)
             format_name = "MXFP8"
         else:
             raise ValueError(
@@ -242,14 +249,45 @@ def _lower_dense_gemm(
             )
         if _tile_k_override not in valid_tile_k or k % _tile_k_override:
             if format_name == "NVFP4":
-                requirement = "128, 256, or 512"
+                requirement = "128, 256, 512, or 1024"
             else:
-                requirement = "one of (64, 128)"
+                requirement = "one of (64, 128, 256)"
             raise ValueError(
                 f"{format_name} _tile_k_override must be {requirement} and divide "
                 f"logical K={k}, got {_tile_k_override}"
             )
+        if (
+            format_name == "MXFP8"
+            and _tile_k_override == 256
+            and (
+                m > 16
+                or l != 1
+                or mma_tiler_mn not in ((16, 64), (32, 64), (64, 64))
+                or load_path != "tma"
+                or swap_ab is not False
+                or sfb_k_replicated
+            )
+        ):
+            raise ValueError(
+                "MXFP8 K256 requires single-batch M<=16, unswapped 16/32/64x64 "
+                "TMA tiles and independent scale blocks"
+            )
+        if _tile_k_override == 1024 and (
+            sf_vec_size != 16
+            or m > 16
+            or l != 1
+            or not (
+                mma_tiler_mn == (64, 64)
+                or (mma_tiler_mn in ((16, 32), (16, 64)) and not swap_ab)
+            )
+            or load_path != "tma"
+        ):
+            raise ValueError(
+                "NVFP4 K1024 requires single-batch M<=16 and supported TMA tiles"
+            )
         tile_k = _tile_k_override
+    if ab_dtype == "float4_e2m1fn" and mma_tiler_mn == (16, 32) and tile_k != 1024:
+        raise ValueError("native FP4 M16xN32 tiles require K1024 staging")
     if _target_occupancy_override is not None:
         if ab_dtype != "float4_e2m1fn":
             raise ValueError(

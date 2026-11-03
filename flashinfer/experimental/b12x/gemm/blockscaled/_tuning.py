@@ -31,6 +31,7 @@ class BlockscaledQuery:
     out_features: int
     activation_mode: str = "auto"
     source_activation: str = "identity"
+    allow_bf16_atomic_reduction: bool = True
     activation_scale_available: bool = False
     global_scale_kind: str | None = None
     source_contiguous: bool = True
@@ -125,6 +126,7 @@ def quantized_query(query, *, expected_m):
         output_dtype="bfloat16",
         batch=1,
         max_rows=query.num_tokens,
+        allow_bf16_atomic_reduction=query.allow_bf16_atomic_reduction,
         in_features=query.padded_in_features,
         out_features=query.out_features,
         output_mode="functional" if functional else "provided",
@@ -157,6 +159,10 @@ def _validate_query(query, device):
         raise ValueError(
             "packed BF16 execution requires NVFP4, MXFP8, or IQ2_XS weights"
         )
+    if type(query.allow_bf16_atomic_reduction) is not bool:
+        raise TypeError("packed BF16 atomic reduction permission must be bool")
+    if not query.allow_bf16_atomic_reduction and query.recipe != "mxfp8":
+        raise ValueError("FP32 split-K reduction is qualified for MXFP8 only")
     if query.source_activation not in ("identity", "swiglu_bf16"):
         raise ValueError("unsupported packed source activation")
     if query.source_activation == "swiglu_bf16" and (
@@ -437,14 +443,21 @@ def _validate_config(query, config, device):
             raise ValueError("transposed IQ2_XS does not support split-K")
         if (
             type(config.tile_n) is not int
-            or config.tile_n not in ((4,) if simt else (64, 128))
+            or config.tile_n
+            not in (
+                (4,)
+                if simt
+                else (32, 64, 128)
+                if query.recipe == "mxfp8"
+                else (64, 128)
+            )
             or type(config.tile_k) is not int
             or config.tile_k
             not in (
                 (256,)
                 if simt
                 else (64, 128, 256)
-                if query.recipe in ("iq2_xs", "iq2_xxs", "q8_0", "nvfp4")
+                if query.recipe in ("iq2_xs", "iq2_xxs", "q8_0", "nvfp4", "mxfp8")
                 else (64, 128)
             )
             or type(config.split_k) is not int
@@ -477,7 +490,7 @@ def _validate_config(query, config, device):
         if query.workspace_nbytes is not None:
             from ._preparation import _workspace_bytes
 
-            needed = _workspace_bytes(query, config)
+            needed = _workspace_bytes(query, config, device)
             if query.workspace_nbytes < needed:
                 raise ValueError(
                     "caller workspace is too small for quantized execution"
@@ -532,6 +545,8 @@ def _tuning_parameters(query, device):
             ) == (16, 64, 64, 1, 4)
         if parameters["mode"] != "a16":
             return True
+        if parameters["tile_n"] == 32 and query.recipe != "mxfp8":
+            return False
         if parameters["tile_n"] == 4:
             return (
                 query.recipe in BLOCK_CODECS
@@ -546,7 +561,7 @@ def _tuning_parameters(query, device):
             and parameters["tile_k"]
             in (
                 (64, 128, 256)
-                if query.recipe in ("iq2_xs", "iq2_xxs", "q8_0", "nvfp4")
+                if query.recipe in ("iq2_xs", "iq2_xxs", "q8_0", "nvfp4", "mxfp8")
                 else (64, 128)
             )
             and (parameters["tile_m"] == 16 or query.recipe != "mxfp8")
@@ -643,7 +658,7 @@ def _equivalence(query, device, config):
 
 TUNING = TuningContract(
     component_id="gemm.blockscaled_precision",
-    query_schema_version=24,
+    query_schema_version=25,
     config_schema_version=26,
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
@@ -655,7 +670,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate_config,
     default_config=_default_config,
-    candidate_contract_version=36,
+    candidate_contract_version=55,
     knobs=(
         Knob(
             name="mode", values=("a16", "quantized"), binding=ParameterBinding.COMPILE
@@ -665,7 +680,9 @@ TUNING = TuningContract(
             values=(1, 2, 4, 8, 16, 32, 64),
             when=FrozenMapping({"mode": "a16"}),
         ),
-        Knob(name="tile_n", values=(4, 64, 128), when=FrozenMapping({"mode": "a16"})),
+        Knob(
+            name="tile_n", values=(4, 32, 64, 128), when=FrozenMapping({"mode": "a16"})
+        ),
         Knob(name="tile_k", values=(64, 128, 256), when=FrozenMapping({"mode": "a16"})),
         Knob(
             name="split_k", values=(1, 2, 4, 8, 16), when=FrozenMapping({"mode": "a16"})

@@ -35,6 +35,7 @@ def _quantize(
     GROUP: tl.constexpr,
     CHUNKS: tl.constexpr,
     SWIGLU: tl.constexpr = False,
+    PAD_SCALE_ROWS: tl.constexpr = True,
 ):
     row = tl.program_id(0).to(tl.int64)
     group = tl.program_id(1) * CHUNKS + tl.arange(0, CHUNKS)
@@ -100,7 +101,7 @@ def _quantize(
         if (row == 0) & (tl.program_id(1) == 0):
             tl.store(ALPHA, 1.0)
     tl.store(S + _scale_offset(row, group, K // GROUP), sf_byte, group < K // GROUP)
-    if row == 0:
+    if PAD_SCALE_ROWS and row == 0:
         pad = (M // 128).to(tl.int64) * 128 + tl.arange(0, 128)
         tl.store(
             S + _scale_offset(pad[:, None], group[None, :], K // GROUP),
