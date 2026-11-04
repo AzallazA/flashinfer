@@ -63,6 +63,7 @@ from b12x._lib.intrinsics.memory import (
 )
 
 from ._selected_forward_config import SELECTION_WIDTH
+from .forward_paged import _mask_pv_bf16_pair, _max_nan_f32
 from .traits import PagedForwardTraits
 from ._controls import paged_control
 
@@ -748,7 +749,7 @@ def _apply_attention_sink_after_lse_scale(
         if sink_owner:
             old_m = m_frag[mma_q, row_slot]
             sink_m = Float32(mAttentionSinkBias[q_head_idx] * attention_ops.LOG2_E)
-            new_m = attention_ops.fmax(old_m, sink_m)
+            new_m = _max_nan_f32(old_m, sink_m)
             old_scale = (
                 Float32(0.0)
                 if old_m == -Float32.inf
@@ -1153,7 +1154,7 @@ def _donor_update_mdo_states_fp32_pack_p(
         m_prev = Float32(m_frag[0, row_slot])
         m_new = Float32(m_prev)
         for c in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
-            m_new = attention_ops.fmax(m_new, acc_S_mn[row_slot, c])
+            m_new = _max_nan_f32(m_new, acc_S_mn[row_slot, c])
         m_new = cute.arch.warp_reduction_max(m_new, threads_in_group=4)
 
         scale_term = (
@@ -2131,6 +2132,8 @@ def _literal_pv_mma_into_ofrag_bf16_packed(
     apply_v_scale: cutlass.Constexpr,
     debug_regs: cute.Tensor | None = None,
     mma_d_base: cutlass.Constexpr = 0,
+    *,
+    valid_rows,
 ):
     if const_expr(apply_v_scale):
         v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
@@ -2174,6 +2177,13 @@ def _literal_pv_mma_into_ofrag_bf16_packed(
                     debug_regs[dst_idx + 2] = b2
                 if dst_idx + 3 < dst_words:
                     debug_regs[dst_idx + 3] = b3
+            key = (
+                row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
+            )
+            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 if const_expr(apply_v_scale):
                     d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
@@ -2241,6 +2251,8 @@ def _literal_pv_mma_into_ofrag_fp8_quarter_repack(
     num_mma_q,
     num_mma_kv,
     v_scale,
+    *,
+    valid_rows,
 ):
     for quarter in cutlass.range_constexpr(4):
         cute.arch.sync_threads()
@@ -2265,6 +2277,7 @@ def _literal_pv_mma_into_ofrag_fp8_quarter_repack(
             v_scale,
             True,
             mma_d_base=quarter * 4,
+            valid_rows=valid_rows,
         )
 
 
@@ -2285,6 +2298,8 @@ def _literal_pv_mma_into_ofrag_plane_bf16_packed(
     upcast_stride_plane,
     v_scale,
     debug_regs: cute.Tensor | None = None,
+    *,
+    valid_rows,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     for mma_kv in cutlass.range_constexpr(num_mma_kv):
@@ -2327,6 +2342,13 @@ def _literal_pv_mma_into_ofrag_plane_bf16_packed(
                     debug_regs[dst_idx + 2] = b2
                 if dst_idx + 3 < dst_words:
                     debug_regs[dst_idx + 3] = b3
+            key = (
+                row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
+            )
+            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
@@ -2429,6 +2451,8 @@ def _literal_pv_mma_into_ofrag_fp8_raw(
     upcast_stride_v,
     v_scale,
     debug_regs: cute.Tensor | None = None,
+    *,
+    valid_rows,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     v_offset = _permuted_offset_128b(
@@ -2476,6 +2500,13 @@ def _literal_pv_mma_into_ofrag_fp8_raw(
                     debug_regs[dst_idx + 2] = b2
                 if dst_idx + 3 < dst_words:
                     debug_regs[dst_idx + 3] = b3
+            key = (
+                row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
+            )
+            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
@@ -2526,6 +2557,8 @@ def _literal_pv_mma_into_ofrag_fp8_raw_m16n16_b8(
     num_mma_d_vo,
     upcast_stride_v,
     v_scale,
+    *,
+    valid_rows,
 ):
     """Use SM120's byte ldmatrix form to avoid software FP8 transpose."""
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
@@ -2562,6 +2595,13 @@ def _literal_pv_mma_into_ofrag_fp8_raw_m16n16_b8(
             )
             b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_0)
             b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_1)
+            key = (
+                row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
+            )
+            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
@@ -2606,6 +2646,8 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw(
     upcast_stride_plane,
     v_scale,
     debug_regs: cute.Tensor | None = None,
+    *,
+    valid_rows,
 ):
     v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
     upcast_stride_full = upcast_stride_plane * Int32(2)
@@ -2660,6 +2702,13 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw(
                 v_offset_cur = _advance_offset_by_column_128b_2(
                     v_offset_cur, mma_d // 2
                 )
+            key = (
+                row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + (lane % 4) * 2
+            )
+            b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+            b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+            b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+            b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
                     o_frag[mma_q, mma_d, 0],
@@ -2706,6 +2755,8 @@ def _literal_pv_mma_into_ofrag_mxfp8_raw(
     num_mma_d_vo,
     upcast_stride_v,
     v_scale,
+    *,
+    valid_rows,
 ):
     unit_scale = Uint32(0x7F7F7F7F)
     mask16 = Uint32(0xFFFF)
@@ -2798,10 +2849,25 @@ def _literal_pv_mma_into_ofrag_mxfp8_raw(
                 b0_k1, b1_k1 = ldmatrix_m8n8x4_trans_right_half_b16(
                     _smem_addr_from_b128_offset(v_base_addr, v_offset_k1)
                 )
+            key = (
+                row_base
+                + warp_kv_idx * num_mma_kv * 16
+                + mma_pair * 32
+                + (lane % 4) * 2
+            )
+            b0_k0 = _mask_pv_bf16_pair(b0_k0, key, valid_rows)
+            b1_k0 = _mask_pv_bf16_pair(b1_k0, key + Int32(8), valid_rows)
+            b0_k1 = _mask_pv_bf16_pair(b0_k1, key + Int32(16), valid_rows)
+            b1_k1 = _mask_pv_bf16_pair(b1_k1, key + Int32(24), valid_rows)
             b0_k0 = frag_layout_swizzle_16b_to_8b_trans(b0_k0)
             b1_k0 = frag_layout_swizzle_16b_to_8b_trans(b1_k0)
             b0_k1 = frag_layout_swizzle_16b_to_8b_trans(b0_k1)
             b1_k1 = frag_layout_swizzle_16b_to_8b_trans(b1_k1)
+            # Pair K16 halves while keeping each register on one output column.
+            b0 = (b0_k0 & mask16) | ((b0_k1 & mask16) << shift16)
+            b1 = (b1_k0 & mask16) | ((b1_k1 & mask16) << shift16)
+            b2 = (b0_k0 >> shift16) | ((b0_k1 >> shift16) << shift16)
+            b3 = (b1_k0 >> shift16) | ((b1_k1 >> shift16) << shift16)
 
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
@@ -2813,8 +2879,8 @@ def _literal_pv_mma_into_ofrag_mxfp8_raw(
                     a_regs[mma_q, 1],
                     a_regs[mma_q, 2],
                     a_regs[mma_q, 3],
-                    b0_k0,
-                    b0_k1,
+                    b0,
+                    b1,
                     unit_scale,
                     unit_scale,
                 )
@@ -2827,8 +2893,8 @@ def _literal_pv_mma_into_ofrag_mxfp8_raw(
                     a_regs[mma_q, 1],
                     a_regs[mma_q, 2],
                     a_regs[mma_q, 3],
-                    b1_k0,
-                    b1_k1,
+                    b2,
+                    b3,
                     unit_scale,
                     unit_scale,
                 )
@@ -3037,23 +3103,19 @@ def _literal_update_mdo_states_fp32_pack_p(
             m_prev = Float32(m_frag[mma_q, row_slot])
             m_new = Float32(m_prev)
             for mma_kv in cutlass.range_constexpr(num_mma_kv):
-                m_local = attention_ops.fmax(
-                    attention_ops.fmax(
+                m_local = _max_nan_f32(
+                    _max_nan_f32(
                         s_frag[mma_q, mma_kv, row_slot * 2 + 0],
                         s_frag[mma_q, mma_kv, row_slot * 2 + 1],
                     ),
-                    attention_ops.fmax(
+                    _max_nan_f32(
                         s_frag[mma_q, mma_kv, row_slot * 2 + 4],
                         s_frag[mma_q, mma_kv, row_slot * 2 + 5],
                     ),
                 )
-                m_new = attention_ops.fmax(m_new, m_local)
-            m_new = attention_ops.fmax(
-                m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2)
-            )
-            m_new = attention_ops.fmax(
-                m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1)
-            )
+                m_new = _max_nan_f32(m_new, m_local)
+            m_new = _max_nan_f32(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
+            m_new = _max_nan_f32(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
 
             m_scaled = (
                 Float32(m_new * sm_scale_log2)
@@ -6341,16 +6403,6 @@ class PagedForwardKernel:
                             dst_word_offset,
                         )
                     _exit_thread()
-                if const_expr(self.kv_is_fp8 and self.traits.num_warps_kv > 1):
-                    if warp_kv_base >= tile_tokens:
-                        for mma_q in cutlass.range_constexpr(num_mma_q):
-                            for row_slot in cutlass.range_constexpr(2):
-                                m_frag[mma_q, row_slot] = Float32(-Float32.inf)
-                                d_frag[mma_q, row_slot] = Float32(1.0)
-                            for mma_d in cutlass.range_constexpr(num_mma_d_vo):
-                                for reg_id in cutlass.range_constexpr(8):
-                                    o_frag[mma_q, mma_d, reg_id] = Float32(0.0)
-
                 if const_expr(self.debug_dump_paged_kv_extend_state):
                     if (
                         work_idx == Int32(0)
@@ -6566,6 +6618,7 @@ class PagedForwardKernel:
                                     tc_upcast_stride_plane,
                                     v_scale,
                                     mDebugU32,
+                                    valid_rows=tile_tokens,
                                 )
                             else:
                                 _literal_pv_mma_into_ofrag_fp8_raw(
@@ -6584,6 +6637,7 @@ class PagedForwardKernel:
                                     tc_upcast_stride_vo,
                                     v_scale,
                                     mDebugU32,
+                                    valid_rows=tile_tokens,
                                 )
                         elif const_expr(self.use_paged_v_tma):
                             v_stage_plane_offset = Int32(
@@ -6621,6 +6675,7 @@ class PagedForwardKernel:
                                 tc_upcast_stride_plane,
                                 v_scale,
                                 mDebugU32,
+                                valid_rows=tile_tokens,
                             )
                         else:
                             _literal_pv_mma_into_ofrag_bf16_packed(
@@ -6640,6 +6695,7 @@ class PagedForwardKernel:
                                 v_scale,
                                 True,
                                 mDebugU32,
+                                valid_rows=tile_tokens,
                             )
                     _exit_thread()
 
@@ -6690,6 +6746,7 @@ class PagedForwardKernel:
                         num_mma_d_vo,
                         self.traits.upcast_stride_v,
                         v_scale,
+                        valid_rows=tile_tokens,
                     )
                 elif const_expr(self.kv_is_fp8):
                     v_smem_base_addr = shared_ptr_to_u32(
@@ -6708,6 +6765,7 @@ class PagedForwardKernel:
                             num_mma_q,
                             num_mma_kv,
                             v_scale,
+                            valid_rows=tile_tokens,
                         )
                     elif const_expr(self.use_kv_repack):
                         if const_expr(self.use_kv_repack_fp16):
@@ -6724,6 +6782,7 @@ class PagedForwardKernel:
                                 tc_upcast_stride_vo,
                                 v_scale,
                                 False,
+                                valid_rows=tile_tokens,
                             )
                         else:
                             _literal_pv_mma_into_ofrag_bf16_packed(
@@ -6739,6 +6798,7 @@ class PagedForwardKernel:
                                 tc_upcast_stride_vo,
                                 v_scale,
                                 True,
+                                valid_rows=tile_tokens,
                             )
                     elif const_expr(self.use_paged_v_tma):
                         v_stage_plane_offset = Int32(
@@ -6767,6 +6827,7 @@ class PagedForwardKernel:
                             num_mma_d_vo,
                             tc_upcast_stride_plane,
                             v_scale,
+                            valid_rows=tile_tokens,
                         )
                     else:
                         if const_expr(self.use_m16n16_b8_fp8_pv):
@@ -6784,6 +6845,7 @@ class PagedForwardKernel:
                                 num_mma_d_vo,
                                 self.traits.upcast_stride_v,
                                 v_scale,
+                                valid_rows=tile_tokens,
                             )
                         else:
                             _literal_pv_mma_into_ofrag_fp8_raw(
@@ -6800,6 +6862,7 @@ class PagedForwardKernel:
                                 num_mma_d_vo,
                                 self.traits.upcast_stride_v,
                                 v_scale,
+                                valid_rows=tile_tokens,
                             )
                 else:
                     v_smem_base_addr = shared_ptr_to_u32(
@@ -6842,6 +6905,7 @@ class PagedForwardKernel:
                             num_mma_d_vo,
                             tc_upcast_stride_plane,
                             v_scale,
+                            valid_rows=tile_tokens,
                         )
                     else:
                         _literal_pv_mma_into_ofrag_bf16_packed(
@@ -6859,6 +6923,7 @@ class PagedForwardKernel:
                             tc_upcast_stride_vo,
                             v_scale,
                             True,
+                            valid_rows=tile_tokens,
                         )
 
                 if const_expr(
@@ -7214,7 +7279,7 @@ class PagedForwardKernel:
                                     merged_m = part_m
                                     merged_d = part_d
                                 elif part_m != -Float32.inf:
-                                    new_m = attention_ops.fmax(merged_m, part_m)
+                                    new_m = _max_nan_f32(merged_m, part_m)
                                     merged_d = Float32(
                                         merged_d
                                         * _exp2_approx_ftz_f32(merged_m - new_m)

@@ -33,7 +33,6 @@ from cutlass.cutlass_dsl import Int64
 from cutlass.cute.nvgpu import cpasync
 
 from b12x.attention._shared.cute import copy as cute_copy
-from b12x.attention._shared.cute import ops as attention_ops
 from b12x._lib.intrinsics.mma import bf16_mma_m16n16k16_f32
 from b12x._lib.intrinsics.packed import (
     fp8x4_e4m3_to_bfloat2x2_native_sm120,
@@ -54,6 +53,8 @@ from b12x.attention.paged.forward_paged import (
     _literal_pv_mma_into_ofrag_plane_bf16_packed,
     _literal_qk_mma_into_sfrag_plane_bf16,
     _literal_update_mdo_states_fp32_pack_p,
+    _mask_pv_bf16_pair,
+    _max_nan_f32,
     _make_paged_kv_tma_source_tensor,
     _make_payload_memrange,
     _paged_kv_tma_plane_layout,
@@ -175,7 +176,7 @@ def _qk_fp8_into_sfrag(
 
 @cute.jit
 def _pv_fp8_into_ofrag(
-    o_frag, p_frag, v_plane0, v_plane1, lane, key_base, num_mma_d_vo
+    o_frag, p_frag, v_plane0, v_plane1, lane, key_base, num_mma_d_vo, valid_rows
 ):
     """O += P V over one 16-key sub-tile of 128-byte FP8 V rows.
 
@@ -193,6 +194,7 @@ def _pv_fp8_into_ofrag(
     )
     v_row = key_base + lane_row
     row_swizzle = v_row % Int32(8)
+    key = key_base + (lane % Int32(4)) * Int32(2)
     for mma_d in cutlass.range_constexpr(num_mma_d_vo):
         v_plane = v_plane0 if mma_d < 8 else v_plane1
         f0, f1 = ldmatrix_m16n16x1_trans_b8(
@@ -200,6 +202,10 @@ def _pv_fp8_into_ofrag(
         )
         b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f0)
         b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f1)
+        b0 = _mask_pv_bf16_pair(b0, key, valid_rows)
+        b1 = _mask_pv_bf16_pair(b1, key + Int32(8), valid_rows)
+        b2 = _mask_pv_bf16_pair(b2, key, valid_rows)
+        b3 = _mask_pv_bf16_pair(b3, key + Int32(8), valid_rows)
         d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
             o_frag[0, mma_d, 0],
             o_frag[0, mma_d, 1],
@@ -955,6 +961,7 @@ class PagedDecodeKernel:
                                 lane,
                                 Int32(sub * 16),
                                 self.num_mma_d_vo,
+                                tile_tokens,
                             )
                         else:
                             _literal_pv_mma_into_ofrag_plane_bf16_packed(
@@ -972,6 +979,7 @@ class PagedDecodeKernel:
                                 self.num_mma_d_vo,
                                 Int32(PLANE_DIM // 8),
                                 Float32(1.0),
+                                valid_rows=tile_tokens,
                             )
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(empty + buf)
@@ -1013,7 +1021,7 @@ class PagedDecodeKernel:
                     for k in cutlass.range_constexpr(NCW):
                         if Int32(k) < num_key_groups:
                             w = row_group + Int32(k) * num_row_groups
-                            m_star = attention_ops.fmax(
+                            m_star = _max_nan_f32(
                                 m_star, sComb[md_base + (w * 2 + row_slot) * 32 + lane]
                             )
                     has_mass = m_star != -Float32.inf
@@ -1229,13 +1237,17 @@ class PagedDecodeMergeKernel:
         m_local = Float32(-Float32.inf)
         sp = lane
         while sp < active:
-            m_local = attention_ops.fmax(m_local, mLsePart[q_row, head, sp])
+            m_local = _max_nan_f32(m_local, mLsePart[q_row, head, sp])
             sp += Int32(32)
-        m_row = cute.arch.warp_reduction_max(m_local)
+        m_row = m_local
+        for offset in cutlass.range_constexpr(5):
+            m_row = _max_nan_f32(
+                m_row, cute.arch.shuffle_sync_bfly(m_row, offset=1 << offset)
+            )
         sink_log2 = Float32(-Float32.inf)
         if const_expr(self.has_sinks):
             sink_log2 = Float32(mSinks[head] * LOG2_E)
-            m_row = attention_ops.fmax(m_row, sink_log2)
+            m_row = _max_nan_f32(m_row, sink_log2)
         s_local = Float32(0.0)
         if m_row != -Float32.inf:
             sp = lane
@@ -1271,9 +1283,8 @@ class PagedDecodeMergeKernel:
             acc2 = Float32(0.0)
             acc3 = Float32(0.0)
             if m_row != -Float32.inf and lane < Int32(self.head_dim_vo // 4):
-                # Every active split stores finite partials (zero with LSE -inf when
-                # it saw no keys), so weights need no branch; four independent
-                # vector loads per step keep the latency hidden.
+                # Empty splits store zero with LSE -inf, so weights need no branch.
+                # Four independent vector loads per step keep the latency hidden.
                 sp = warp_in_row
                 while sp + Int32(3 * WPR) < active:
                     w0 = cute.math.exp2(

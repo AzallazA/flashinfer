@@ -694,9 +694,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             logical_page = base_logical_page + cutlass.Int32(seq_chunk)
             if logical_page >= safe_page_count:
                 # TMA still needs a legal full-page address for a partial
-                # tile. K tail values are masked before softmax, so clamping
-                # cannot make them logically valid. Paged pools, including
-                # unused slots, are required to contain finite values.
+                # tile. K tail values are masked before softmax and V tail
+                # bytes before PV, so unused slots cannot affect the output.
                 logical_page = safe_page_count - cutlass.Int32(1)
             if cutlass.const_expr(self.cache_page_ids):
                 page_ids[seq_chunk] = cute.arch.make_warp_uniform(
@@ -1503,6 +1502,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         mma_params: SimpleNamespace,
         p_regs: cutlass.Array,
         sV: cutlass.Pointer,
+        valid_rows: cutlass.Int32,
     ) -> None:
         """Compute ``O += P @ V``.
 
@@ -1513,6 +1513,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param mma_params: Shared K/V ring and local output accumulator state.
         :param p_regs: Register-resident FP8 P fragments from softmax.
         :param sV: Shared-memory pointer to this tile's V operand.
+        :param valid_rows: Logical K/V rows in this tile, excluding padding.
         """
         o_regs = mma_params.o_regs
 
@@ -1615,6 +1616,19 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             v_cur[d_pair * 2], v_cur[d_pair * 2 + 1] = load_v_fragment_pair(0, d_pair)
 
         for v_frag in cutlass.range_constexpr(self.pv_v_frags):
+            # LDSM gives each B word four K rows; the second word adds 16.
+            # Mask bytes before MMA because zero probability times NaN is NaN.
+            v_mask_lo = cutlass.Uint32(0)
+            v_mask_hi = cutlass.Uint32(0)
+            for byte in cutlass.range_constexpr(4):
+                v_row = 4 * basic_params.lane_mod4 + byte
+                if cutlass.const_expr(not self.is_causal):
+                    v_row = 2 * (v_row // 4) + (v_row % 2) + 8 * ((v_row % 4) // 2)
+                v_row += v_frag * self.MMA_TILER[2]
+                byte_mask = cutlass.Uint32(0xFF << (8 * byte))
+                v_mask_lo |= cutlass.Uint32(v_row < valid_rows) * byte_mask
+                v_mask_hi |= cutlass.Uint32(v_row + 16 < valid_rows) * byte_mask
+
             prefetch_next = cutlass.const_expr(
                 not (
                     self.head_tile == 256 and self.q_tile == 128 and self.kv_tile == 128
@@ -1645,8 +1659,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         p_reg1,
                         p_reg2,
                         p_reg3,
-                        v_cur[d_frag][0],
-                        v_cur[d_frag][1],
+                        cutlass.Int32(cutlass.Uint32(v_cur[d_frag][0]) & v_mask_lo),
+                        cutlass.Int32(cutlass.Uint32(v_cur[d_frag][1]) & v_mask_hi),
                         o_regs[o_off + 0],
                         o_regs[o_off + 1],
                         o_regs[o_off + 2],
@@ -1721,6 +1735,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         sV: cutlass.Pointer,
         p_regs: cutlass.Array,
         v_initial: cutlass.Array,
+        valid_rows: cutlass.Int32,
     ) -> None:
         """BMM2 with its first V fragment set already resident in registers."""
         o_regs = mma_params.o_regs
@@ -1836,6 +1851,26 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 v_initial[d_frag * 2 + 1],
             )
         for v_frag in cutlass.range_constexpr(self.pv_v_frags):
+            # Use the current fragment's permuted rows for both the initial
+            # preload and subsequent loads, preserving every live FP8 byte.
+            v_mask_lo = cutlass.Uint32(0)
+            v_mask_hi = cutlass.Uint32(0)
+            for byte in cutlass.range_constexpr(4):
+                v_row = 4 * basic_params.lane_mod4 + byte
+                if cutlass.const_expr(
+                    self.is_causal
+                    and self.head_tile == 128
+                    and self.q_tile == 128
+                    and self.kv_tile == 128
+                ):
+                    v_row = (v_row & 0x9) + ((v_row & 0x2) << 1) + ((v_row & 0x4) >> 1)
+                elif cutlass.const_expr(not self.is_causal):
+                    v_row = 2 * (v_row // 4) + (v_row % 2) + 8 * ((v_row % 4) // 2)
+                v_row += v_frag * self.MMA_TILER[2]
+                byte_mask = cutlass.Uint32(0xFF << (8 * byte))
+                v_mask_lo |= cutlass.Uint32(v_row < valid_rows) * byte_mask
+                v_mask_hi |= cutlass.Uint32(v_row + 16 < valid_rows) * byte_mask
+
             v_seq_off_next = ((v_frag + 1) % self.pv_v_frags) * self.MMA_TILER[2]
             v_next = [None] * self.pv_d_frags
 
@@ -1852,8 +1887,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         p_reg1,
                         p_reg2,
                         p_reg3,
-                        v_cur[d_frag][0],
-                        v_cur[d_frag][1],
+                        cutlass.Int32(cutlass.Uint32(v_cur[d_frag][0]) & v_mask_lo),
+                        cutlass.Int32(cutlass.Uint32(v_cur[d_frag][1]) & v_mask_hi),
                         o_regs[o_off + 0],
                         o_regs[o_off + 1],
                         o_regs[o_off + 2],
@@ -2061,6 +2096,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             )
 
         kv_seq_idx = kv_tile_idx * self.kv_tile
+        valid_rows = cute.math.min(self.kv_tile, basic_params.seqlen_k - kv_seq_idx)
         enable_skip_softmax = softmax_params.skip_softmax_threshold_log2 is not None
         skip_softmax = cutlass.Boolean(False)
         if cutlass.const_expr(enable_skip_softmax and not uses_softmax_init_path):
@@ -2089,7 +2125,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 # Softmax has no V dependency. Delay the arrival wait until
                 # the first V consumer so scalar work hides the TMA transfer.
                 self.wait_pipeline_barrier(v_arrived, v_phase)
-                self.mma_pv(basic_params, mma_params, p_regs, sV)
+                self.mma_pv(basic_params, mma_params, p_regs, sV, valid_rows)
             else:
                 # Even a skipped tile must consume its V pipeline slot.
                 self.wait_pipeline_barrier(v_arrived, v_phase)
@@ -2105,7 +2141,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 uses_softmax_init_path,
             )
             self.wait_pipeline_barrier(v_arrived, v_phase)
-            self.mma_pv(basic_params, mma_params, p_regs, sV)
+            self.mma_pv(basic_params, mma_params, p_regs, sV, valid_rows)
         if prims.elect_sync():
             v_consumed = self.get_mbar_stage_ptr(basic_params.mbar_consumed, v_stage)
             prims.mbarrier_arrive(
@@ -2173,6 +2209,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             )
 
         kv_seq_idx = kv_tile_idx * self.kv_tile
+        valid_rows = cute.math.min(self.kv_tile, basic_params.seqlen_k - kv_seq_idx)
         skip_softmax = cutlass.Boolean(False)
         if cutlass.const_expr(enable_skip_softmax and not uses_softmax_init_path):
             if cutlass.const_expr(tracks_tile_row_max):
@@ -2213,6 +2250,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     sV,
                     p_regs,
                     v_initial,
+                    valid_rows,
                 )
         else:
             p_regs, v_initial = self.online_softmax_single_buffer(
@@ -2233,6 +2271,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 sV,
                 p_regs,
                 v_initial,
+                valid_rows,
             )
         if prims.elect_sync():
             prims.mbarrier_arrive(
@@ -2526,7 +2565,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         # Every later wrap advances each stage by one generation.
                         if operand_idx > self.kv_pipeline_stages:
                             empty_phase ^= cutlass.Int32(1)
-            else:
+            elif num_kv_tiles > 0:
                 sK = self.get_kv_stage_ptr(sKV, cutlass.Int32(0))
                 sV = self.get_kv_stage_ptr(sKV, cutlass.Int32(1))
                 k_arrived = self.get_mbar_stage_ptr(mbar_arrived, cutlass.Int32(0))
@@ -2930,11 +2969,16 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             # final sV tile. After that lifetime barrier, normalize O, stage an
             # stmatrix-friendly layout, and store 128b per lane to GMEM.
             sO = cutlass.Pointer(sKV.data_ptr(), dtype=o.dtype)
+            # Fully masked causal rows have exactly zero probability mass.
             row_sum_inv_0 = (
-                cute.math.rcp(row_sum_0, approx=True, ftz=True) * output_scale
+                cutlass.Float32(0.0)
+                if row_sum_0 == 0.0
+                else cute.math.rcp(row_sum_0, approx=True, ftz=True) * output_scale
             )
             row_sum_inv_1 = (
-                cute.math.rcp(row_sum_1, approx=True, ftz=True) * output_scale
+                cutlass.Float32(0.0)
+                if row_sum_1 == 0.0
+                else cute.math.rcp(row_sum_1, approx=True, ftz=True) * output_scale
             )
             for d_frag_pair in cutlass.range_constexpr(self.pv_d_frags // 2):
                 o_off = (d_frag_pair * 2) * 4
@@ -3137,9 +3181,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
 
         :param q: Packed query ``(total_q, Hq, D)``.
         :param k: Packed key ``(total_k, Hkv, D)`` or HND paged K pool
-            ``(num_pages, Hkv, num_tokens_per_page, D)``. Paged pools must
-            contain finite values in every slot, including unused padding.
-        :param v: Packed or paged value with the same shape and finite-value
+            ``(num_pages, Hkv, num_tokens_per_page, D)``. Slots beyond each
+            request's logical K/V length are ignored.
+        :param v: Packed or paged value with the same shape and logical-length
             contract as K.
         :param o: Packed output ``(total_q, Hq, D)``.
         :param lse: Optional packed float32 log2 LSE ``(total_q,Hq)``.
