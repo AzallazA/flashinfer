@@ -548,26 +548,23 @@ def plan(
         inplace=inplace,
     )
     TUNING.validate_query(query, None)
-    native_plans = {}
 
     def native(config):
-        if config not in native_plans:
-            q, runtime = alternatives[config.implementation]
-            call = dict(q.call)
-            call["threads"] = config.threads
-            call["blocks" if "blocks" in call else "block_limit"] = config.blocks
-            if config.implementation in ISLAND_VARIANTS:
-                call["active_blocks"] = config.active_blocks
-            if config.implementation in JOINT_FAMILIES or config.implementation in (
-                "dcp_phased",
-                "dcp_ring",
-                "dcp_recursive",
-                "dcp_recursive_ready",
-            ):
-                call.update(submode=config.submode, active_blocks=config.active_blocks)
-            q = replace(q, call=FrozenMapping(call))
-            native_plans[config] = _provider(q.surface).plan(q, runtime=runtime)
-        return native_plans[config]
+        q, runtime = alternatives[config.implementation]
+        call = dict(q.call)
+        call["threads"] = config.threads
+        call["blocks" if "blocks" in call else "block_limit"] = config.blocks
+        if config.implementation in ISLAND_VARIANTS:
+            call["active_blocks"] = config.active_blocks
+        if config.implementation in JOINT_FAMILIES or config.implementation in (
+            "dcp_phased",
+            "dcp_ring",
+            "dcp_recursive",
+            "dcp_recursive_ready",
+        ):
+            call.update(submode=config.submode, active_blocks=config.active_blocks)
+        q = replace(q, call=FrozenMapping(call))
+        return _provider(q.surface).plan(q, runtime=runtime)
 
     return Plan(
         contract=TUNING,

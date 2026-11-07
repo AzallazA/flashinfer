@@ -8,7 +8,7 @@ import torch
 
 from b12x._lib.compile_plan import load_programs
 from b12x._lib.compile_pool import CompileJob
-from b12x.preparation import MemoryRequirements, PersistentMemory, Plan
+from b12x.preparation import MemoryRequirements, PersistentMemory, Plan, current_plan
 from ._tuning import TUNING
 
 GATHER_MODES = {
@@ -236,7 +236,9 @@ def plan(query, *, runtime, invocation, override):
         _memory_requirements=lambda config, device: MemoryRequirements(
             persistent=(
                 PersistentMemory(("pcie-dcp-runtime", id(runtime)), resident, resident),
-                PersistentMemory(("pcie-gather-selector", id(query)), 4, 4),
+                PersistentMemory(
+                    ("pcie-gather-selector", current_plan(), config), 4, 4
+                ),
             )
         ),
         _materialize=materialize,
