@@ -17,6 +17,15 @@ from ._tuning import PcieQuery, TUNING as NATIVE
 from ._joint_profile import JOINT_FAMILIES, profile_records
 
 
+# Compiled transport specializations: (local push, cross-island scatter/gather).
+ISLAND_VARIANTS = {
+    "island_rs": (False, False),
+    "island_rsag": (False, True),
+    "island_push": (True, False),
+    "island_push_rsag": (True, True),
+}
+
+
 @dataclass(frozen=True, kw_only=True)
 class CollectiveConfig:
     implementation: str
@@ -36,11 +45,67 @@ class CollectiveQuery:
     inplace: bool = False
 
 
-def _configs(query):
+def _configs(query, device=None):
     for name, payload in query.alternatives.items():
         call = payload["call"]
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
+        if name in ISLAND_VARIANTS:
+            # Physical CTAs keep buffer parity synchronized. Only participating
+            # CTAs advance communication epochs, so active counts can vary safely.
+            counts = (
+                (threads,)
+                if payload["setup"].get("threads_override", False)
+                else tuple(dict.fromkeys((threads, 128, 256, 512, 768, 1024)))
+            )
+            fixed = any(
+                payload["setup"].get(key, False)
+                for key in (
+                    "threads_override",
+                    "blocks_override",
+                    "active_blocks_override",
+                )
+            )
+            active_counts = (
+                (int(call["active_blocks"]),) if fixed else range(1, blocks + 1)
+            )
+            for count in counts:
+                for active in active_counts:
+                    yield CollectiveConfig(
+                        implementation=name,
+                        threads=count,
+                        blocks=blocks,
+                        active_blocks=active,
+                    )
+            continue
+        if name in ("dcp_phased", "dcp_ring", "dcp_recursive", "dcp_recursive_ready"):
+            # Automatic admission covers the qualified TP16 hardware. Phased
+            # kernels also have to pass the native cluster occupancy check.
+            if (
+                device is None
+                or device.vendor != "nvidia"
+                or device.compute_capability != (12, 0)
+                or device.sm_count < 64
+            ):
+                continue
+            counts = (
+                (threads,)
+                if payload["setup"].get("threads_override", 0)
+                else (
+                    (128,)
+                    if name in ("dcp_ring", "dcp_recursive", "dcp_recursive_ready")
+                    else (128, 256, 512)
+                )
+            )
+            for count in counts:
+                yield CollectiveConfig(
+                    implementation=name,
+                    threads=count,
+                    blocks=8,
+                    submode="barrier",
+                    active_blocks=8,
+                )
+            continue
         if name in JOINT_FAMILIES:
             cluster_size = call.get("joint_cluster_size", 1)
             if cluster_size != 1:
@@ -200,9 +265,10 @@ def _efficient_plain_grid(query, value):
 
 
 def _parameters(query, device):
-    configs = tuple(dict.fromkeys(_configs(query)))
+    configs = tuple(dict.fromkeys(_configs(query, device)))
     effort = capture_autotune_effort()
     if effort is AutotuneEffort.OFF:
+        eligible = {config.implementation for config in configs}
         configs = tuple(
             dict.fromkeys(
                 CollectiveConfig(
@@ -217,6 +283,7 @@ def _parameters(query, device):
                     ),
                 )
                 for name, payload in query.alternatives.items()
+                if name in eligible
             )
         )
     legal_configs = frozenset(configs)
@@ -233,12 +300,18 @@ def _parameters(query, device):
         # Plain reductions measure pull alongside the payload-ready transports.
         efficiency_predicates=(
             lambda value: (
+                value["implementation"] not in ISLAND_VARIANTS
+                or value["active_blocks"] == query.default.active_blocks
+                or value["active_blocks"] & (value["active_blocks"] - 1) == 0
+            ),
+            lambda value: (
                 value["implementation"] != "pull"
                 or query.default.implementation == "pull"
                 or query.operation == "all_reduce"
             ),
-            lambda value: effort is AutotuneEffort.OFF
-            or _efficient_plain_grid(query, value),
+            lambda value: (
+                effort is AutotuneEffort.OFF or _efficient_plain_grid(query, value)
+            ),
         ),
         autotune_effort=effort,
     )
@@ -252,15 +325,58 @@ def _validate_query(query, device):
         or not 0 <= query.rank < query.world_size
     ):
         raise ValueError("collective tuning requires a supported world size and rank")
-    for payload in query.alternatives.values():
+    for name, payload in query.alternatives.items():
         native = PcieQuery(**payload)
         NATIVE.validate_query(native, device)
         if (native.world_size, native.rank) != (query.world_size, query.rank):
             raise ValueError("native alternatives must use the same rank group")
+        if name in ISLAND_VARIANTS and (
+            query.operation != "all_reduce"
+            or query.world_size != 16
+            or native.surface != "PCIeIslandRSAllReduce.all_reduce"
+        ):
+            raise ValueError("island launch tuning requires its TP16 reduction owner")
+        if name in ISLAND_VARIANTS:
+            from ._island_rs_cute import island_rs_peers
+
+            if (
+                bool(native.call.get("local_push", False)),
+                bool(native.call.get("cross_island_rsag", False)),
+            ) != ISLAND_VARIANTS[name]:
+                raise ValueError(
+                    "island implementation differs from its compiled protocol"
+                )
+
+            if tuple(native.setup["peer_ranks"]) != island_rs_peers(
+                native.rank, native.world_size
+            ):
+                raise ValueError(
+                    "island tuning peers differ from the rank's reduction topology"
+                )
+        if name in (
+            "dcp_phased",
+            "dcp_ring",
+            "dcp_recursive",
+            "dcp_recursive_ready",
+        ) and (
+            query.operation != "all_gather_heads"
+            or query.world_size != 16
+            or not native.surface.endswith(".all_gather_heads")
+            or native.call.get("gather_transport")
+            != {
+                "dcp_ring": "selected_ring",
+                "dcp_recursive": "selected_recursive",
+                "dcp_recursive_ready": "selected_recursive_ready",
+                "dcp_phased": "selected_phased_barrier",
+            }[name]
+        ):
+            raise ValueError("selected gather tuning requires its TP16 barrier profile")
 
 
 def _validate_config(query, config, device):
-    if not isinstance(config, CollectiveConfig) or config not in tuple(_configs(query)):
+    if not isinstance(config, CollectiveConfig) or config not in tuple(
+        _configs(query, device)
+    ):
         raise ValueError(
             "configuration is outside the native collective parameter space"
         )
@@ -299,6 +415,9 @@ def _collective_signature(query):
         del native["rank"]
         for section in ("call", "setup"):
             native[section].pop("device_index", None)
+        if name in ISLAND_VARIANTS:
+            # These peers are determined by the validated rank and TP16 topology.
+            native["setup"].pop("peer_ranks")
         alternatives[name] = native
     return dict(
         operation=query.operation,
@@ -310,6 +429,9 @@ def _collective_signature(query):
 
 def _family_bucket(query):
     if query.operation != "all_reduce":
+        return None
+    if any(name in query.alternatives for name in ISLAND_VARIANTS):
+        # Retain independent measurements for each message shape and fixed grid.
         return None
     from math import prod
 
@@ -362,8 +484,8 @@ def _family_bucket(query):
 
 TUNING = TuningContract(
     component_id="comm.pcie",
-    query_schema_version=7,
-    candidate_contract_version=3,
+    query_schema_version=8,
+    candidate_contract_version=5,
     config_schema_version=2,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")
@@ -434,7 +556,14 @@ def plan(
             call = dict(q.call)
             call["threads"] = config.threads
             call["blocks" if "blocks" in call else "block_limit"] = config.blocks
-            if config.implementation in JOINT_FAMILIES:
+            if config.implementation in ISLAND_VARIANTS:
+                call["active_blocks"] = config.active_blocks
+            if config.implementation in JOINT_FAMILIES or config.implementation in (
+                "dcp_phased",
+                "dcp_ring",
+                "dcp_recursive",
+                "dcp_recursive_ready",
+            ):
                 call.update(submode=config.submode, active_blocks=config.active_blocks)
             q = replace(q, call=FrozenMapping(call))
             native_plans[config] = _provider(q.surface).plan(q, runtime=runtime)

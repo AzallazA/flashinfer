@@ -162,24 +162,33 @@ def query_from_runtime(
         inp, out = raw["inp"], raw.get("out")
         from .pcie_island_rs import _pick_blocks
 
-        blocks = (
-            int(raw["blocks"])
-            if raw.get("blocks") is not None
-            else (
-                runtime.blocks
-                if runtime.blocks is not None
-                else _pick_blocks(inp.numel())
+        blocks = int(runtime.blocks)
+        if raw.get("blocks") is not None and int(raw["blocks"]) != blocks:
+            raise ValueError(
+                "the island owner's physical grid cannot change between calls"
             )
-        )
+        blocks_override = runtime.blocks_override or raw.get("blocks") is not None
+        active = raw.get("active_blocks")
+        if active is None:
+            active = (
+                blocks if blocks_override else min(blocks, _pick_blocks(inp.numel()))
+            )
         controls = {
             "threads": int(runtime.threads),
             "wait_nanosleep_cycles": int(runtime.wait_nanosleep_cycles),
             "blocks": blocks,
+            "active_blocks": int(active),
+            "inplace": out is not None and out.data_ptr() == inp.data_ptr(),
+            "cross_island_rsag": False,
+            "local_push": False,
             "inp": _tensor_call(inp),
             "output": None if out is None else _tensor_call(out),
         }
         setup = {
             "max_elements": int(runtime.max_elements),
+            "threads_override": bool(getattr(runtime, "threads_override", False)),
+            "blocks_override": bool(blocks_override),
+            "active_blocks_override": raw.get("active_blocks") is not None,
             "quarter_capacity": int(runtime.quarter_capacity),
             "stage_offset": int(runtime.stage_offset),
             "part_offset": int(runtime.part_offset),
@@ -256,6 +265,8 @@ def compile_owner_surface(query_payload, ordinal):
                 ordinal,
                 threads=call["threads"],
                 wait_nanosleep_cycles=call["wait_nanosleep_cycles"],
+                cross_island_rsag=call.get("cross_island_rsag", False),
+                local_push=call.get("local_push", False),
             )
     raise ValueError(f"unsupported PCIe owner surface {query.surface!r}")
 
@@ -303,6 +314,11 @@ def plan(
         raise ValueError("query surface does not match the existing PCIe runtime owner")
     if (int(runtime.rank), int(runtime.world_size)) != (query.rank, query.world_size):
         raise ValueError("query does not match the existing PCIe runtime owner")
+    if (
+        query.surface == "PCIeIslandRSAllReduce.all_reduce"
+        and query.call["blocks"] != runtime.blocks
+    ):
+        raise ValueError("query differs from the island owner's fixed physical grid")
 
     def memory(_config, _device):
         slab = int(query.setup["slab_bytes"])
@@ -414,6 +430,7 @@ def prepared_call(state, **actual):
                 out,
                 query.call["blocks"],
                 actual.get("stream"),
+                active_blocks=query.call["active_blocks"],
             ),
             output=out,
             capture_safe=True,

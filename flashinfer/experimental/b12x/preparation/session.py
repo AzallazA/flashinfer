@@ -463,6 +463,8 @@ class PreparationSession:
         self._job = None
         self._pending_collective_barrier = None
         self._plans = {}
+        self._scratch_limit = None
+        self._scratch_limit_locked = False
         self._shared = {}
         self._guard = None
         self._tuning_rank = 0
@@ -503,6 +505,50 @@ class PreparationSession:
         self._tuning_rank = rank
         self._tuning_ranks = ranks
         self._tuning_cache_synchronized = False
+
+    def configure_scratch_limit(self, max_bytes: int | None) -> None:
+        """Limit each candidate's scratch before starting preparation jobs.
+
+        Autotuning excludes configurations above this byte count. Explicit,
+        default, and retained selections must fit. ``None`` removes the limit.
+        """
+        self._check_thread()
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
+            raise ValueError("scratch limit must be a nonnegative byte count or None")
+        if self._scratch_limit_locked and max_bytes != self._scratch_limit:
+            raise RuntimeError(
+                "scratch limit must be configured before preparation begins"
+            )
+        self._scratch_limit = max_bytes
+
+    def _candidate_memory(self, requests, config):
+        requirements, seen, shared = [], set(), False
+        for request in requests:
+            plan = request.plan
+            if plan in seen:
+                continue
+            seen.add(plan)
+            if plan.shared and shared and self._scratch_limit is None:
+                continue
+            with _plan_scope(plan):
+                requirement = plan._memory_requirements(config, self.device)
+            requirements.append(
+                replace(requirement, persistent=())
+                if plan.shared and shared
+                else requirement
+            )
+            shared |= plan.shared
+        requirement = MemoryRequirements.sequential(requirements)
+        if (
+            self._scratch_limit is not None
+            and requirement.scratch_nbytes > self._scratch_limit
+        ):
+            raise CandidateResourceIneligibleError(
+                f"{requests[0].plan.component_id} configuration {config!r} requires "
+                f"{requirement.scratch_nbytes} scratch bytes, exceeding the session "
+                f"scratch limit of {self._scratch_limit} bytes"
+            )
+        return requirement
 
     @property
     def cache_policy(self):
@@ -583,6 +629,7 @@ class PreparationSession:
             autotune=(self.autotune if autotune is None else autotune)
             and self._autotune_effort is not AutotuneEffort.OFF,
         )
+        self._scratch_limit_locked = True
         self._job = job
         if self.state != "FROZEN":
             self.state = "PREPARING"
@@ -643,24 +690,30 @@ class PreparationSession:
                     *(config for _, config in plan.contract.iterate(configuration)),
                 )
             )
-            plans, shared = [], False
-            for request in requests:
-                candidate = request.plan
-                if candidate in plans or (candidate.shared and shared):
-                    continue
-                plans.append(candidate)
-                shared |= candidate.shared
             seen = set()
+            admitted = 0
             for config in configs:
                 payload = plan.contract.config_payload(config)
                 if payload in seen:
                     continue
                 seen.add(payload)
-                for candidate in plans:
-                    with _plan_scope(candidate):
-                        requirements.append(
-                            candidate._memory_requirements(config, self.device)
-                        )
+                try:
+                    requirement = self._candidate_memory(requests, config)
+                except CandidateResourceIneligibleError:
+                    if (
+                        self._scratch_limit is None
+                        or configuration.pinned is not None
+                        or self._autotune_effort is AutotuneEffort.OFF
+                    ):
+                        raise
+                    continue
+                admitted += 1
+                requirements.append(requirement)
+            if not admitted:
+                raise CandidateResourceIneligibleError(
+                    f"no eligible configurations for {plan.component_id} within "
+                    f"the session scratch limit of {self._scratch_limit} bytes"
+                )
         return MemoryRequirements.sequential(requirements)
 
     def cancel_tuning(self):
@@ -1349,6 +1402,10 @@ class PreparationJob:
         return digest(identity)
 
     def _selection(self, obligation, config, source, assignment=None):
+        if self.session._scratch_limit is not None:
+            self.session._candidate_memory(
+                obligation.requests or (obligation.request,), config
+            )
         return Selection(
             obligation.request.plan.component_id,
             obligation.configuration.encoded_query,
@@ -1356,6 +1413,18 @@ class PreparationJob:
             source,
             assignment,
         )
+
+    def _validate_retained_scratch(self, obligation, prepared):
+        if self.session._scratch_limit is None:
+            return
+        requests = obligation.requests or (obligation.request,)
+        self.session._candidate_memory(requests, prepared.selection.config)
+        plan = obligation.request.plan
+        for item in prepared.finalists:
+            config = plan.contract._lower(
+                plan.query, self.session.device.identity, item.assignment
+            )
+            self.session._candidate_memory(requests, config)
 
     def _validate_finalists(self, obligation, records):
         policy = obligation.request.finalist_policy
@@ -1378,9 +1447,11 @@ class PreparationJob:
                     "finalist candidate index is outside the legal catalog"
                 )
             indices.add(index)
-            assignment, _ = obligation.candidates[index]
+            assignment, config = obligation.candidates[index]
             if item.assignment != FrozenMapping(assignment):
                 raise ValueError("finalist assignment differs from its candidate index")
+            if self.session._scratch_limit is not None:
+                self.session._candidate_memory(obligation.requests, config)
             family = FrozenMapping(
                 {name: assignment[name] for name in policy.family_fields}
             )
@@ -1467,6 +1538,7 @@ class PreparationJob:
             and not self.session._stop.is_set()
         ):
             return False
+        self._validate_retained_scratch(obligation, prepared)
         previous = plan._prepared
         prepared.users.append(plan)
         plan._install(prepared)
@@ -1580,6 +1652,7 @@ class PreparationJob:
                     or prepared.selection.source != "default"
                 )
             ):
+                self._validate_retained_scratch(obligation, prepared)
                 obligation.selection = prepared.selection
                 obligation.finalists = prepared.finalists
                 obligation.ready = True
@@ -1650,10 +1723,29 @@ class PreparationJob:
                                 coverage,
                                 iterator.payloads,
                             )
+                    if self.session._scratch_limit is not None:
+                        eligible = []
+                        for candidate in obligation.candidates:
+                            try:
+                                self.session._candidate_memory(requests, candidate[1])
+                            except CandidateResourceIneligibleError:
+                                continue
+                            eligible.append(candidate)
+                        excluded = len(obligation.candidates) - len(eligible)
+                        obligation.candidates = eligible
+                        coverage = dict(coverage)
+                        coverage["scratch_ineligible_count"] = excluded
+                        obligation.coverage = dict(coverage)
                     self._global_candidate_count = self._candidate_count = len(
                         obligation.candidates
                     )
                     if complete and not obligation.candidates:
+                        if self.session._scratch_limit is not None and excluded:
+                            raise CandidateResourceIneligibleError(
+                                f"no eligible configurations for {plan.component_id} "
+                                f"within the session scratch limit of "
+                                f"{self.session._scratch_limit} bytes"
+                            )
                         raise ValueError(
                             f"no eligible configurations for {plan.component_id}"
                         )
@@ -1723,7 +1815,8 @@ class PreparationJob:
         contract = plan.contract
         state = obligation.discovery
         if state is None or state.done:
-            cached = self._described_candidates.get(_declaration_key(plan))
+            catalog_key = self._candidate_catalog_key(obligation)
+            cached = self._described_candidates.get(catalog_key)
             if cached is not None:
                 (
                     obligation.candidate_program_identity,
@@ -1815,10 +1908,22 @@ class PreparationJob:
         state.done = True
         if obligation.request is self._active_request:
             self._candidates_described = len(obligation.candidates)
-        self._described_candidates[_declaration_key(obligation.request.plan)] = (
+        self._described_candidates[self._candidate_catalog_key(obligation)] = (
             obligation.candidate_program_identity,
             obligation.compiled,
             obligation.programs,
+        )
+
+    def _candidate_catalog_key(self, obligation):
+        declaration = _declaration_key(obligation.request.plan)
+        if self.session._scratch_limit is None:
+            return declaration
+        return (
+            declaration,
+            tuple(
+                (FrozenMapping(assignment), self._payload(obligation, config))
+                for assignment, config in obligation.candidates
+            ),
         )
 
     def _discover_candidates(self, obligation, state, wait):
@@ -2710,6 +2815,8 @@ class PreparationJob:
     def _install_obligation(self, obligation, selections):
         request, plan = obligation.request, obligation.request.plan
         selection = obligation.selection
+        if self.session._scratch_limit is not None:
+            self.session._candidate_memory(obligation.requests, selection.config)
         self._active_request = request
         if self._warmup_only:
             obligation.finalists = ()
@@ -2766,6 +2873,8 @@ class PreparationJob:
                     if prepared is not None
                     else self._selection(obligation, configuration.default, source)
                 )
+            if self.session._scratch_limit is not None:
+                self.session._candidate_memory(obligation.requests, selection.config)
             if (
                 prepared is None
                 or prepared.selection != selection
@@ -2995,6 +3104,10 @@ class PreparationJob:
             self._total_requests = len(groups)
             for request in requests:
                 plan = request.plan
+                if self.session._scratch_limit is not None:
+                    self._validate_retained_scratch(
+                        _Obligation(request, None), plan.prepared
+                    )
                 self._plans_by_name[request.name] = plan
                 if request.retain_benchmark_call:
                     if request.collective is not None:

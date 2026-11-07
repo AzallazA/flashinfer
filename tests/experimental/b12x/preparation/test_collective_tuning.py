@@ -77,6 +77,161 @@ def test_dcp_candidates_coalesce_effective_grids_and_preserve_overrides():
     assert values[0][1] == query.default
 
 
+def _island_query(rank=0, *, threads=512, override=False, inplace=False):
+    from b12x.comm.pcie._collective_tuning import CollectiveConfig, CollectiveQuery
+    from b12x.comm.pcie._island_rs_cute import island_rs_peers
+
+    native = dict(
+        surface="PCIeIslandRSAllReduce.all_reduce",
+        world_size=16,
+        rank=rank,
+        topology="pcie_ipc",
+        call=dict(
+            threads=threads,
+            blocks=64,
+            active_blocks=16,
+            inplace=inplace,
+            inp=dict(shape=(1024, 7168), dtype="torch.bfloat16"),
+        ),
+        setup=dict(peer_ranks=island_rs_peers(rank, 16), threads_override=override),
+    )
+    return CollectiveQuery(
+        operation="all_reduce",
+        world_size=16,
+        rank=rank,
+        alternatives=FrozenMapping({"island_rs": native}),
+        inplace=inplace,
+        default=CollectiveConfig(
+            implementation="island_rs", threads=threads, blocks=64, active_blocks=16
+        ),
+    )
+
+
+def test_island_tunes_threads_and_participation_on_a_fixed_grid():
+    from b12x.comm.pcie._collective_tuning import TUNING, _family_bucket
+    from b12x.preparation import autotune_effort
+
+    query = _island_query()
+    with autotune_effort("default"):
+        configs = [
+            config for _, config in TUNING.iterate(TUNING.configure(query, device=None))
+        ]
+    assert {config.threads for config in configs} == {128, 256, 512, 768, 1024}
+    assert {config.submode for config in configs} == {""}
+    assert {config.blocks for config in configs} == {64}
+    assert {config.active_blocks for config in configs} == {1, 2, 4, 8, 16, 32, 64}
+    assert _family_bucket(query) is None
+    with autotune_effort("off"):
+        configs = [
+            config for _, config in TUNING.iterate(TUNING.configure(query, device=None))
+        ]
+    assert configs == [query.default]
+
+
+def test_island_explicit_thread_setting_remains_fixed():
+    from b12x.comm.pcie._collective_tuning import TUNING
+    from b12x.preparation import autotune_effort
+
+    query = _island_query(threads=160, override=True)
+    with autotune_effort("default"):
+        configs = [
+            config for _, config in TUNING.iterate(TUNING.configure(query, device=None))
+        ]
+    assert configs == [query.default]
+
+
+@pytest.mark.parametrize("active", (0, 65, True))
+def test_island_rejects_invalid_participation(active):
+    from b12x.comm.pcie._tuning import PcieQuery, TUNING as NATIVE
+
+    payload = _island_query().alternatives["island_rs"].to_dict()
+    payload["call"]["active_blocks"] = active
+    with pytest.raises(ValueError, match="participation"):
+        NATIVE.validate_query(PcieQuery(**payload), None)
+
+
+def test_island_explicit_grid_preserves_participation():
+    from b12x.comm.pcie._collective_tuning import TUNING
+    from b12x.preparation import autotune_effort
+
+    query = _island_query()
+    payload = query.alternatives["island_rs"].to_dict()
+    payload["setup"]["blocks_override"] = True
+    query = replace(query, alternatives=FrozenMapping({"island_rs": payload}))
+    with autotune_effort("default"):
+        configs = [c for _, c in TUNING.iterate(TUNING.configure(query, device=None))]
+    assert {c.active_blocks for c in configs} == {16}
+    assert {c.blocks for c in configs} == {64}
+    assert len(configs) == 5
+
+
+def test_island_non_power_of_two_participation_is_legal():
+    from b12x.comm.pcie._collective_tuning import TUNING
+
+    query = _island_query()
+    TUNING.validate_config(query, replace(query.default, active_blocks=3), None)
+
+
+def test_island_native_override_preserves_fixed_declaration():
+    import torch
+    from b12x.comm.pcie._preparation import plan
+    from b12x.comm.pcie._tuning import PcieQuery, TUNING as NATIVE
+    from b12x.comm.pcie._collective_tuning import TUNING as COLLECTIVE
+    from b12x.comm.pcie.pcie_island_rs import PCIeIslandRSAllReduce
+    from b12x.preparation import BackendConfig, ParameterBinding, autotune_effort
+
+    # Declaration only: no allocator, process group, or CUDA context is needed.
+    owner = object.__new__(PCIeIslandRSAllReduce)
+    owner.device, owner.rank, owner.world_size = torch.device("cuda", 0), 0, 16
+    owner.blocks = 64
+    native = PcieQuery(**_island_query().alternatives["island_rs"])
+    prepared = plan(native, runtime=owner)
+    assert prepared.contract is COLLECTIVE
+    assert set(prepared.query.alternatives) == {
+        "island_rs",
+        "island_rsag",
+        "island_push",
+        "island_push_rsag",
+    }
+    assert (
+        prepared.query.alternatives["island_rsag"]["call"]["cross_island_rsag"] is True
+    )
+    assert (
+        next(k for k in COLLECTIVE.knobs if k.name == "implementation").binding
+        is ParameterBinding.COMPILE
+    )
+    with autotune_effort("default"):
+        configs = [
+            c
+            for _, c in COLLECTIVE.iterate(
+                COLLECTIVE.configure(prepared.query, device=None)
+            )
+        ]
+    assert len(configs) == 140
+    assert {c.submode for c in configs} == {""}
+    fixed = plan(native, runtime=owner, override=BackendConfig(backend="native"))
+    assert fixed.contract is NATIVE
+
+
+def test_island_rank_signature_preserves_topology_and_aliasing():
+    from b12x.comm.pcie._collective_tuning import TUNING, _collective_signature
+
+    queries = [_island_query(rank) for rank in range(16)]
+    for query in queries:
+        TUNING.validate_query(query, None)
+        assert _collective_signature(query) == _collective_signature(queries[0])
+    assert _collective_signature(_island_query(inplace=True)) != _collective_signature(
+        queries[0]
+    )
+    native = queries[1].alternatives["island_rs"].to_dict()
+    native["setup"]["peer_ranks"] = queries[0].alternatives["island_rs"]["setup"][
+        "peer_ranks"
+    ]
+    invalid = replace(queries[1], alternatives=FrozenMapping({"island_rs": native}))
+    with pytest.raises(ValueError, match="peers differ"):
+        TUNING.validate_query(invalid, None)
+
+
 @pytest.mark.parametrize("shape", [(3, 1536), (513, 2560), (8,)])
 @pytest.mark.parametrize("world", (2, 3, 4, 6, 8, 10))
 @pytest.mark.parametrize("dtype", ("bfloat16", "float16"))

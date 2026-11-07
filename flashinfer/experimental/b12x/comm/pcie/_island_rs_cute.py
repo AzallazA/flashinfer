@@ -124,7 +124,9 @@ def _nanosleep(cycles: Uint32, *, loc=None, ip=None) -> None:
 @cute.jit
 def _wait_for(address: Int64, generation: Uint32, cycles: int) -> None:
     observed = _load_acquire_sys_u32(address)
-    while observed < generation:
+    # A later ready tag also suffices. Signed modular comparison preserves this
+    # ordering across wrap; the two-slot protocol bounds producer advancement.
+    while Int32(observed - generation) < Int32(0):
         if cutlass.const_expr(cycles > 0):
             _nanosleep(Uint32(cycles))
         observed = _load_acquire_sys_u32(address)
@@ -197,12 +199,13 @@ _ISLAND_SIZE = 4
 _MAX_ISLANDS = 4
 _MAX_WORLD_SIZE = _ISLAND_SIZE * _MAX_ISLANDS
 
-# One 128-byte line per (block, slot); 32 blocks x 4 slots per region.
-_RS_ARRIVED = 256
-_XS_ARRIVED = 16_640
-_AG_ARRIVED = 33_024
-HEADER_BYTES = 49_408
-MAX_BLOCKS = 32
+# Generation counters precede three regions with one cache line per CTA and peer.
+MAX_BLOCKS = 64
+_ACTIVE_EPOCH_OFFSET = MAX_BLOCKS * 4
+_RS_ARRIVED = ((_ACTIVE_EPOCH_OFFSET + MAX_BLOCKS * 4 + 255) // 256) * 256
+_XS_ARRIVED = _RS_ARRIVED + MAX_BLOCKS * _ISLAND_SIZE * 128
+_AG_ARRIVED = _XS_ARRIVED + MAX_BLOCKS * _ISLAND_SIZE * 128
+HEADER_BYTES = _AG_ARRIVED + MAX_BLOCKS * _ISLAND_SIZE * 128
 
 
 def island_rs_peers(rank: int, world_size: int) -> tuple[int, ...]:
@@ -228,6 +231,8 @@ class _IslandRSLaunch:
         *,
         threads: int = 128,
         wait_nanosleep_cycles: int = 24,
+        cross_island_rsag: bool = False,
+        local_push: bool = False,
     ) -> None:
         if world_size != _MAX_WORLD_SIZE:
             raise ValueError(f"unsupported world size {world_size}")
@@ -235,6 +240,12 @@ class _IslandRSLaunch:
             raise ValueError(f"invalid rank {rank} for world size {world_size}")
         if not 32 <= threads <= 1024 or threads % 32:
             raise ValueError("threads must be a multiple of 32 in [32, 1024]")
+        if type(cross_island_rsag) is not bool:
+            raise TypeError("cross_island_rsag must be a boolean")
+        if type(local_push) is not bool:
+            raise TypeError("local_push must be a boolean")
+        self._local_push = local_push
+        self._cross_island_rsag = cross_island_rsag
         self._world_size = int(world_size)
         self._rank = int(rank)
         self._threads = int(threads)
@@ -269,6 +280,7 @@ class _IslandRSLaunch:
         quarter_capacity: Int64,
         elements: Int64,
         blocks: Int32,
+        active_blocks: Int32,
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(
@@ -295,6 +307,7 @@ class _IslandRSLaunch:
             final_offset,
             quarter_capacity,
             elements,
+            active_blocks,
         ).launch(
             grid=(blocks, 1, 1),
             block=[self._threads, 1, 1],
@@ -328,6 +341,7 @@ class _IslandRSLaunch:
         final_offset: Int64,
         quarter_capacity: Int64,
         elements: Int64,
+        active_blocks: Int32,
     ) -> None:
         slabs = (
             slab0,
@@ -349,22 +363,67 @@ class _IslandRSLaunch:
         )
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        gdim, _, _ = cute.arch.grid_dim()
         self_base = Int64(slabs[self._rank].toint())
 
         allocator = cutlass.utils.SmemAllocator()
         shared_generation = allocator.allocate_tensor(
             element_type=cutlass.Uint32,
-            layout=cute.make_layout((1,)),
+            layout=cute.make_layout((2,)),
             byte_alignment=4,
         )
         if tidx == Int32(0):
             shared_generation[0] = _atomic_add_global_u32(
                 self_base + Int64(bidx) * Int64(4), Uint32(1)
             ) + Uint32(1)
+            epoch = Uint32(0)
+            if bidx < active_blocks:
+                epoch = _atomic_add_global_u32(
+                    self_base + Int64(_ACTIVE_EPOCH_OFFSET) + Int64(bidx) * Int64(4),
+                    Uint32(1),
+                ) + Uint32(1)
+            shared_generation[1] = epoch
         cute.arch.barrier()
-        generation = Uint32(shared_generation[0])
-        if generation % Uint32(2) != Uint32(0):
+        data_generation = Uint32(shared_generation[0])
+        # Every physical CTA advances buffer parity. Communication epochs advance
+        # only for participating CTAs, keeping their last flags within one epoch
+        # even when a CTA has been inactive across a global counter rollover.
+        if bidx < active_blocks:
+            self._participate(
+                slabs,
+                input_ptr,
+                output_ptr,
+                stage_offset,
+                part_offset,
+                final_offset,
+                quarter_capacity,
+                elements,
+                data_generation,
+                Uint32(shared_generation[1]),
+                self_base,
+                tidx,
+                bidx,
+                active_blocks,
+            )
+
+    @cute.jit
+    def _participate(
+        self,
+        slabs,
+        input_ptr,
+        output_ptr,
+        stage_offset,
+        part_offset,
+        final_offset,
+        quarter_capacity,
+        elements,
+        data_generation,
+        generation,
+        self_base,
+        tidx,
+        bidx,
+        gdim,
+    ):
+        if data_generation % Uint32(2) != Uint32(0):
             stage_offset += quarter_capacity * Int64(_ISLAND_SIZE * 4)
             part_offset += quarter_capacity * Int64(4)
             final_offset += quarter_capacity * Int64(_ISLAND_SIZE * 4)
@@ -379,11 +438,8 @@ class _IslandRSLaunch:
         input_words = cute.recast_ptr(input_ptr.align(4), dtype=Uint32)
         output_words = cute.recast_ptr(output_ptr.align(4), dtype=Uint32)
 
-        # Every remote transfer is a read. The equal-quarter ownership keeps
-        # any rank from moving the complete vector on behalf of its island.
-
-        # Phase 1 -- publish my whole input locally, then reduce my quarter by
-        # pulling it out of the four island stages.
+        # Each rank reduces one quarter. Local push delivers that quarter's
+        # four input contributions into its staging plane before the reduction.
         self_stage = cute.recast_ptr(
             cute.make_ptr(
                 cutlass.BFloat16,
@@ -403,9 +459,26 @@ class _IslandRSLaunch:
             if stop > pairs:
                 stop = pairs
             index = start
-            while index < stop - begin:
-                self_stage[begin + index] = input_words[begin + index]
-                index += stride
+            if cutlass.const_expr(self._local_push):
+                destination = self._island * _ISLAND_SIZE + lane
+                destination_stage = cute.recast_ptr(
+                    cute.make_ptr(
+                        cutlass.BFloat16,
+                        Int64(slabs[destination].toint()) + stage_offset,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    ).align(4),
+                    dtype=Uint32,
+                )
+                while index < stop - begin:
+                    destination_stage[Int64(self._lane) * quarter + index] = (
+                        input_words[begin + index]
+                    )
+                    index += stride
+            else:
+                while index < stop - begin:
+                    self_stage[begin + index] = input_words[begin + index]
+                    index += stride
         cute.arch.barrier()
         if tidx == Int32(0):
             _fence_sc_sys()
@@ -446,29 +519,68 @@ class _IslandRSLaunch:
             dtype=Uint32,
         )
         index = start
+        # Read four independent stride positions before consuming peer values.
+        # Each block retains the residue classes covered by its arrival flag.
+        while index + Int64(3) * stride < mine_length:
+            words = ()
+            for p in cutlass.range_constexpr(_ISLAND_SIZE):
+                peer = self._island * _ISLAND_SIZE + p
+                if cutlass.const_expr(self._local_push):
+                    peer_stage = self_stage
+                    peer_begin = Int64(p) * quarter
+                else:
+                    peer_begin = mine_begin
+                    peer_stage = cute.recast_ptr(
+                        cute.make_ptr(
+                            cutlass.BFloat16,
+                            Int64(slabs[peer].toint()) + stage_offset,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ).align(4),
+                        dtype=Uint32,
+                    )
+                for item in cutlass.range_constexpr(4):
+                    words += (peer_stage[peer_begin + index + Int64(item) * stride],)
+            for item in cutlass.range_constexpr(4):
+                total_lo = Float32(0.0)
+                total_hi = Float32(0.0)
+                for p in cutlass.range_constexpr(_ISLAND_SIZE):
+                    lo, hi = unpack_bf16x2(words[p * 4 + item])
+                    total_lo += lo
+                    total_hi += hi
+                self_part[index + Int64(item) * stride] = pack_f32x2_to_bf16x2(
+                    total_lo, total_hi
+                )
+            index += Int64(4) * stride
         while index < mine_length:
             total_lo = Float32(0.0)
             total_hi = Float32(0.0)
             for p in cutlass.range_constexpr(_ISLAND_SIZE):
                 peer = self._island * _ISLAND_SIZE + p
-                peer_stage = cute.recast_ptr(
-                    cute.make_ptr(
-                        cutlass.BFloat16,
-                        Int64(slabs[peer].toint()) + stage_offset,
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    ).align(4),
-                    dtype=Uint32,
-                )
-                lo, hi = unpack_bf16x2(peer_stage[mine_begin + index])
+                if cutlass.const_expr(self._local_push):
+                    peer_stage = self_stage
+                    peer_begin = Int64(p) * quarter
+                else:
+                    peer_begin = mine_begin
+                    peer_stage = cute.recast_ptr(
+                        cute.make_ptr(
+                            cutlass.BFloat16,
+                            Int64(slabs[peer].toint()) + stage_offset,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ).align(4),
+                        dtype=Uint32,
+                    )
+                lo, hi = unpack_bf16x2(peer_stage[peer_begin + index])
                 total_lo += lo
                 total_hi += hi
             self_part[index] = pack_f32x2_to_bf16x2(total_lo, total_hi)
             index += stride
         cute.arch.barrier()
 
-        # Phase 2 -- combine the four island partials for my quarter, again by
-        # pulling, from the same lane in every island.
+        # The XS mailbox publishes partial-ready (2*g), then final-ready (2*g+1)
+        # for scattered stripes. A later tag also certifies the still-live partials.
+        # Both modes sum island partials in the same order before BF16 conversion.
         if tidx == Int32(0):
             _fence_sc_sys()
             for j in cutlass.range_constexpr(_MAX_ISLANDS):
@@ -481,13 +593,13 @@ class _IslandRSLaunch:
                             bidx,
                             Int32(self._island),
                         ),
-                        generation,
+                        generation * Uint32(2),
                     )
             for j in cutlass.range_constexpr(_MAX_ISLANDS):
                 if cutlass.const_expr(j != self._island):
                     _wait_for(
                         _flag_address(self_base, _XS_ARRIVED, bidx, Int32(j)),
-                        generation,
+                        generation * Uint32(2),
                         self._wait_nanosleep_cycles,
                     )
         cute.arch.barrier()
@@ -501,7 +613,42 @@ class _IslandRSLaunch:
             ).align(4),
             dtype=Uint32,
         )
+        # Distribute stride positions across islands without changing which
+        # CTA owns their publication flags. The final plane already reserves a
+        # full vector and can hold both partial and assembled final quarters.
+        cross_stride = stride
         index = start
+        if cutlass.const_expr(self._cross_island_rsag):
+            index += Int64(self._island) * stride
+            cross_stride *= Int64(_MAX_ISLANDS)
+        # Read four independent cross_stride positions before consuming peer values.
+        # Each block retains the residue classes covered by its arrival flag.
+        while index + Int64(3) * cross_stride < mine_length:
+            words = ()
+            for p in cutlass.range_constexpr(_ISLAND_SIZE):
+                partner = p * _ISLAND_SIZE + self._lane
+                partner_part = cute.recast_ptr(
+                    cute.make_ptr(
+                        cutlass.BFloat16,
+                        Int64(slabs[partner].toint()) + part_offset,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    ).align(4),
+                    dtype=Uint32,
+                )
+                for item in cutlass.range_constexpr(4):
+                    words += (partner_part[index + Int64(item) * cross_stride],)
+            for item in cutlass.range_constexpr(4):
+                total_lo = Float32(0.0)
+                total_hi = Float32(0.0)
+                for p in cutlass.range_constexpr(_ISLAND_SIZE):
+                    lo, hi = unpack_bf16x2(words[p * 4 + item])
+                    total_lo += lo
+                    total_hi += hi
+                value = pack_f32x2_to_bf16x2(total_lo, total_hi)
+                self_final[mine_begin + index + Int64(item) * cross_stride] = value
+                output_words[mine_begin + index + Int64(item) * cross_stride] = value
+            index += Int64(4) * cross_stride
         while index < mine_length:
             total_lo = Float32(0.0)
             total_hi = Float32(0.0)
@@ -522,11 +669,74 @@ class _IslandRSLaunch:
             value = pack_f32x2_to_bf16x2(total_lo, total_hi)
             self_final[mine_begin + index] = value
             output_words[mine_begin + index] = value
-            index += stride
+            index += cross_stride
         cute.arch.barrier()
 
-        # Phase 3 -- island all-gather, pulling the three quarters I do not own
-        # straight into my output.
+        if cutlass.const_expr(self._cross_island_rsag):
+            if tidx == Int32(0):
+                _fence_sc_sys()
+                for j in cutlass.range_constexpr(_MAX_ISLANDS):
+                    if cutlass.const_expr(j != self._island):
+                        partner = j * _ISLAND_SIZE + self._lane
+                        _store_release_sys_u32(
+                            _flag_address(
+                                Int64(slabs[partner].toint()),
+                                _XS_ARRIVED,
+                                bidx,
+                                Int32(self._island),
+                            ),
+                            generation * Uint32(2) + Uint32(1),
+                        )
+                for j in cutlass.range_constexpr(_MAX_ISLANDS):
+                    if cutlass.const_expr(j != self._island):
+                        _wait_for(
+                            _flag_address(self_base, _XS_ARRIVED, bidx, Int32(j)),
+                            generation * Uint32(2) + Uint32(1),
+                            self._wait_nanosleep_cycles,
+                        )
+            cute.arch.barrier()
+            for j in cutlass.range_constexpr(_MAX_ISLANDS):
+                if cutlass.const_expr(j != self._island):
+                    partner = j * _ISLAND_SIZE + self._lane
+                    partner_final = cute.recast_ptr(
+                        cute.make_ptr(
+                            cutlass.BFloat16,
+                            Int64(slabs[partner].toint()) + final_offset,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ).align(4),
+                        dtype=Uint32,
+                    )
+                    index = start + Int64(j) * stride
+                    while index < mine_length:
+                        value = partner_final[mine_begin + index]
+                        self_final[mine_begin + index] = value
+                        output_words[mine_begin + index] = value
+                        index += cross_stride
+            cute.arch.barrier()
+
+        # Publish completed quarters. Pushed quarters occupy disjoint ranges
+        # in each recipient's existing final plane and are copied locally.
+        if cutlass.const_expr(self._local_push):
+            for p in cutlass.range_constexpr(_ISLAND_SIZE):
+                if cutlass.const_expr(p != self._lane):
+                    push_peer = self._island * _ISLAND_SIZE + p
+                    destination_final = cute.recast_ptr(
+                        cute.make_ptr(
+                            cutlass.BFloat16,
+                            Int64(slabs[push_peer].toint()) + final_offset,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ).align(4),
+                        dtype=Uint32,
+                    )
+                    index = start
+                    while index < mine_length:
+                        destination_final[mine_begin + index] = self_final[
+                            mine_begin + index
+                        ]
+                        index += stride
+            cute.arch.barrier()
         if tidx == Int32(0):
             _fence_sc_sys()
             for p in cutlass.range_constexpr(_ISLAND_SIZE):
@@ -553,15 +763,18 @@ class _IslandRSLaunch:
         for p in cutlass.range_constexpr(_ISLAND_SIZE):
             if cutlass.const_expr(p != self._lane):
                 peer = self._island * _ISLAND_SIZE + p
-                peer_final = cute.recast_ptr(
-                    cute.make_ptr(
-                        cutlass.BFloat16,
-                        Int64(slabs[peer].toint()) + final_offset,
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    ).align(4),
-                    dtype=Uint32,
-                )
+                if cutlass.const_expr(self._local_push):
+                    peer_final = self_final
+                else:
+                    peer_final = cute.recast_ptr(
+                        cute.make_ptr(
+                            cutlass.BFloat16,
+                            Int64(slabs[peer].toint()) + final_offset,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ).align(4),
+                        dtype=Uint32,
+                    )
                 begin = Int64(p) * quarter
                 stop = begin + quarter
                 if stop > pairs:
@@ -580,6 +793,8 @@ def get_island_rs_launcher(
     *,
     threads: int = 128,
     wait_nanosleep_cycles: int = 24,
+    cross_island_rsag: bool = False,
+    local_push: bool = False,
 ) -> Callable[..., None]:
     """Return the rank-specialized TP16 island reduce-scatter launcher."""
 
@@ -589,12 +804,16 @@ def get_island_rs_launcher(
         rank,
         threads=threads,
         wait_nanosleep_cycles=wait_nanosleep_cycles,
+        cross_island_rsag=cross_island_rsag,
+        local_push=local_push,
     )
     cache_key = (
         int(world_size),
         int(rank),
         int(threads),
         int(wait_nanosleep_cycles),
+        bool(cross_island_rsag),
+        bool(local_push),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=launch, cache_key=cache_key
@@ -616,6 +835,7 @@ def get_island_rs_launcher(
         1,
         1,
         1,
+        1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.island_rs.bf16",
@@ -626,6 +846,8 @@ def get_island_rs_launcher(
                 "rank",
                 "threads",
                 "wait_nanosleep_cycles",
+                "cross_island_rsag",
+                "local_push",
             ),
         ),
     )
@@ -641,6 +863,7 @@ def get_island_rs_launcher(
         elements: int,
         blocks: int,
         stream: object = None,
+        active_blocks: int | None = None,
     ) -> None:
         """Launch the compiled island reduce-scatter with runtime arguments."""
         if len(slab_addresses) != world_size:
@@ -649,6 +872,9 @@ def get_island_rs_launcher(
             )
         if not 1 <= int(blocks) <= MAX_BLOCKS:
             raise ValueError(f"blocks must be in [1, {MAX_BLOCKS}], got {blocks}")
+        active_blocks = blocks if active_blocks is None else active_blocks
+        if not 1 <= int(active_blocks) <= int(blocks):
+            raise ValueError("active blocks must fit the fixed physical grid")
         raw(
             *(
                 make_ptr(
@@ -677,6 +903,7 @@ def get_island_rs_launcher(
             quarter_capacity,
             elements,
             blocks,
+            active_blocks,
             cuda_stream_from_int_or_current(cuda_stream_to_int(stream)),
         )
 

@@ -14,6 +14,8 @@ tuning keys. Every caller still binds its own serving operands.
 | Staged `AllReduce.all_reduce`, direct peer groups | Native pull; LL and Simple peer push; BF16 payload-ready full reduction and reduce-scatter/all-gather; provisioned BF16 two-shot |
 | Staged fused residual addition and RMSNorm | Native staged transports compatible with declared input, residual, normalization, grouping, and output arithmetic |
 | DCP `all_gather_heads` and `lse_reduce_scatter`, TP2/4/8 | Thread count and block limit; equivalent effective grids are measured once |
+| DCP `all_gather_heads`, TP16 | Ordinary DCP geometry; phased, ring, and recursive profiles on SM120 devices with at least 64 SMs |
+| IslandRS `all_reduce`, TP16 | Thread and active-CTA counts; local pull or push; cross-island full reduction or reduce-scatter/all-gather with a fixed physical grid |
 
 Payload-ready transports require their reserved incoming slots, BF16 support,
 and sufficient SMs to keep their grid resident. Two-shot retains its native
@@ -45,6 +47,34 @@ Tuning races the native alternatives over their launch geometry; explicitly
 disabled tuning retains the static dispatch policy. Explicit
 `CollectiveConfig(implementation=..., threads=..., blocks=...)` pins a legal
 configuration. Native low-level plans still use `PcieConfig`.
+
+TP16 gather tuning retains ordinary DCP as its default. Selected alternatives
+require disjoint contiguous, 16-byte-aligned rows. The phased profile requires a
+compiled kernel that can keep its complete eight-CTA cluster active; its
+unpinned thread counts are 128, 256, and 512. The ring and recursive profiles use 128
+threads and no cluster. All selected profiles have eight physical and active CTAs. Existing DCP
+thread and block overrides constrain every implementation. A block override
+other than eight excludes the selected profiles; a thread override other than
+128 excludes ring and recursive profiles. `PcieConfig(backend="native")`
+retains the fixed native declaration. Each exact message shape races normally
+without enabling a runtime ladder or changing the all-reduce channel.
+The loaded phased kernel must pass its occupancy check before capture; failure
+stops preparation.
+
+IslandRS channels use one physical grid that fits one CTA per SM on every rank,
+up to 64 CTAs. Preparation races active-CTA counts within that grid and 128,
+256, 512, 768, and 1024 threads. Explicit launch overrides retain their declared
+participation. Candidate choices share the channel's peer mappings and slab
+layout, ordered FP32 sums, and BF16 conversion points. Every physical CTA
+advances the data-buffer generation; only participating CTAs advance their
+communication epoch. Separate counters preserve bank parity and prevent stale
+flags from satisfying waits when an inactive CTA rejoins after counter rollover.
+Each shape and input/output alias pattern keeps its own selection. Local push
+places input quarters and completed reduction quarters in the recipients'
+existing staging planes. Cross-island reduce-scatter/all-gather assigns each
+stride position to one island, then gathers the completed BF16 values. Partial
+and final readiness use distinct tags in the existing mailbox. Their signed
+modular ordering supports generation wrap with the two-bank lifetime bound.
 
 Default-effort plain all-reduce tuning calibrates transfer-size buckets before
 restricting exact-shape races to two families. Bucket upper bounds are
@@ -83,8 +113,11 @@ must remain serialized.
 
 The `_benchmark.py` fixtures allocate private operands, generate and reset inputs,
 capture candidate calls, and check arithmetic before timing. They preserve
-declared tensor layouts and residual aliasing. A caller can supply an explicit
-`benchmark_call` for a different representative execution context.
+declared tensor layouts and residual aliasing. Gather fixtures change arbitrary
+byte patterns, poison their destinations, and compare exact output and input
+bytes, including NaN payloads and FP32 values transported through BF16 views.
+A caller can supply an explicit `benchmark_call` for a different representative
+execution context.
 
 All ranks compile and bind a candidate before any rank primes it. Each rank
 queues the same captured calls behind a stream gate; the coordinator releases
@@ -347,6 +380,65 @@ with `gather_transport` set to `joint`, `selected_barrier`, or
 `selected_word_exchange` compile a fixed geometry and retain a device selector.
 Explicit profiles passed to `joint_startup_spec` use the shared captured startup
 tuner. Ordinary DCP plans retain their preparation-time selection policy.
+
+Experimental phased gathers send the complete local input to one destination
+at a time. They reuse the DCP channel's two staging banks and signals, and
+launch one eight-CTA cluster. Every thread fences its phase writes before the
+cluster advances, including threads with no remaining input. The
+`selected_phased_barrier` transport also synchronizes peer ranks after each
+destination; `selected_phased_push` uses one peer barrier after all sends.
+Both assemble exact token-major output from local staging after peer completion.
+
+These transports require `block_limit=8`, `active_blocks=8`, and
+`submode="barrier"`. Materialization checks the compiled kernel's cluster
+residency before capture. Other active/grid combinations are rejected; the
+ordinary gather defaults do not change. For an established `DcpAllToAll`
+channel and matching contiguous input/output tensors, declare a phased plan
+with explicit geometry:
+
+```python
+from dataclasses import replace
+from b12x.comm import pcie
+from b12x.preparation import FrozenMapping
+
+query = pcie.query_from_runtime(
+    runtime,
+    surface="DcpAllToAll.all_gather_heads",
+    call=dict(local_input=source, out=output, threads=128, block_limit=8),
+)
+query = replace(query, call=FrozenMapping(dict(
+    query.call,
+    gather_transport="selected_phased_barrier",
+    submode="barrier",
+    active_blocks=8,
+)))
+plan = pcie.plan(query, runtime=runtime)
+```
+
+Submit this plan through the ordinary collective preparation session. Selected
+barrier profiles and ordinary captured DCP calls share the channel's bank origin
+and device epoch. Joint word exchange retains canonical packet and counter
+offsets even when that barrier origin is bank one. All ranks must use the same
+profile and serialize calls sharing a channel; profile changes require earlier
+replays to have drained.
+
+The experimental `selected_ring` profile uses one fixed outgoing neighbor and
+one incoming neighbor. Each CTA relays its own 512-byte segments through all
+other ranks, copying received bytes into their final output positions before
+acknowledging receive storage. Later hops read those output positions. Ready
+and acknowledgment records reuse the channel's per-CTA, per-peer counters;
+ordinary calls remain pairwise-compatible with those counters. Staging banks
+and operation epochs retain the same layout.
+
+Ring and recursive declarations require TP16, `threads=128`, `block_limit=8`,
+`active_blocks=8`, and `submode="barrier"`; they use no cluster. Set
+`gather_transport="selected_ring"` in the declaration above to select the ring.
+The `selected_recursive` profile exchanges one, two, four, then eight rank
+segments with XOR partners. Each CTA forwards its own completed output segments
+and acknowledges their consumption. The `selected_recursive_ready` profile
+omits these acknowledgments. Its two staging banks protect received values
+until the intervening serialized collective requires every rank to finish the
+preceding call before the same bank can be reused.
 
 ```sh
 torchrun --standalone --nproc-per-node=4 -m b12x.tools.collective_ladder \

@@ -22,11 +22,12 @@ from .pcie_oneshot import (
     PCIeOneshotAllReduce,
     _finish_collective_runtime_setup,
     _normalize_device,
+    _run_collective_preallocation_setup,
 )
 
 
 SUPPORTED_WORLD_SIZES = (16,)
-SUPPORTED_BLOCKS = (1, 2, 4, 8, 16, 32)
+SUPPORTED_BLOCKS = (1, 2, 4, 8, 16, 32, 64)
 _ISLAND_SIZE = 4
 _ALIGNMENT = 256
 
@@ -86,7 +87,14 @@ class PCIeIslandRSAllReduce:
         blocks: Optional[int] = None,
         ipc: object = None,
     ) -> None:
-        """``ipc`` supplies the CUDA IPC allocator for the slab, as the hierarchical runtime accepts."""
+        """Allocate an ordered channel with a fixed physical CUDA grid.
+
+        Automatic grids use at most 64 CTAs and fit one CTA per SM on every
+        participating device; preparation tunes their active participation.
+        Explicit ``blocks`` retains full participation unless the prepared
+        call also declares ``active_blocks``. ``ipc`` supplies the shared slab
+        allocator used by the hierarchical runtime.
+        """
         self.group = exchange_group
         self.rank = dist.get_rank(group=exchange_group)
         self.world_size = dist.get_world_size(group=exchange_group)
@@ -103,8 +111,27 @@ class PCIeIslandRSAllReduce:
             raise ValueError("max_elements must be a positive even count")
 
         self.max_elements = int(max_elements)
-        self.blocks = None if blocks is None else int(blocks)
+        self.blocks_override = blocks is not None
+        sms = _run_collective_preallocation_setup(
+            owner="PCIe island reduce-scatter capability query",
+            exchange_group=self.group,
+            setup=lambda: int(
+                torch.cuda.get_device_properties(self.device).multi_processor_count
+            ),
+        )
+        limits = [None] * self.world_size
+        dist.all_gather_object(limits, (sms, blocks), group=self.group)
+        if len({requested for _, requested in limits}) != 1:
+            raise ValueError("island ranks must request the same physical grid")
+        resident_limit = min(int(sms) for sms, _ in limits)
+        automatic = min(MAX_BLOCKS, 1 << (resident_limit.bit_length() - 1))
+        self.blocks = automatic if blocks is None else int(blocks)
+        if self.blocks > resident_limit:
+            raise ValueError(
+                "island physical grid must fit one CTA per SM on every rank"
+            )
         self.threads = _threads_from_env()
+        self.threads_override = "B12X_PCIE_ISLAND_RS_THREADS" in os.environ
         self.wait_nanosleep_cycles = _wait_nanosleep_cycles_from_env()
 
         max_pairs = self.max_elements // 2
@@ -186,6 +213,7 @@ class PCIeIslandRSAllReduce:
         plan: Plan,
         out: Optional[torch.Tensor] = None,
         blocks: Optional[int] = None,
+        active_blocks: Optional[int] = None,
         stream: object = None,
         channel_id: Optional[str] = None,
     ) -> torch.Tensor:
@@ -214,9 +242,14 @@ class PCIeIslandRSAllReduce:
             raise ValueError("blocks differs from the prepared island plan")
         if selected not in SUPPORTED_BLOCKS or selected > MAX_BLOCKS:
             raise ValueError(f"blocks must be one of {SUPPORTED_BLOCKS}")
-        return self._run_prepared(state.launcher(), inp, out, selected, stream)
+        participating = int(state.query.call["active_blocks"])
+        if active_blocks is not None and int(active_blocks) != participating:
+            raise ValueError("active_blocks differs from the prepared island plan")
+        return self._run_prepared(
+            state.launcher(), inp, out, selected, stream, active_blocks=participating
+        )
 
-    def _run_prepared(self, launcher, inp, out, blocks, stream):
+    def _run_prepared(self, launcher, inp, out, blocks, stream, *, active_blocks=None):
         """Invoke an already-prepared native launcher after caller validation."""
         with torch.cuda.device(self.device):
             launcher(
@@ -230,6 +263,7 @@ class PCIeIslandRSAllReduce:
                 inp.numel(),
                 blocks,
                 stream,
+                active_blocks=active_blocks,
             )
         return out
 
