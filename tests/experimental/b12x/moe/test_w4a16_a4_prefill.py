@@ -182,8 +182,9 @@ def _bind(xp, x, ids, wts, out, scratch, **kwargs):
 
 @pytest.mark.parametrize("tokens", (128, 4096))
 @pytest.mark.parametrize("explicit", (False, True))
+@pytest.mark.parametrize("ids_dtype", (torch.int32, torch.int64))
 def test_declared_csf_precision_replays_after_scale_scratch_poisoning(
-    tokens, explicit, monkeypatch, tmp_path
+    tokens, explicit, ids_dtype, monkeypatch, tmp_path
 ):
     device = require_b12x()
     from b12x.moe import fused_moe as moe
@@ -207,6 +208,7 @@ def test_declared_csf_precision_replays_after_scale_scratch_poisoning(
     a1g, a2g = _scales(case)
     experts = _prepare(case, a1g, a2g, csf=True)
     x, ids, wts = _inputs(tokens, 24)
+    ids = ids.to(ids_dtype)
     graphs, outputs, plans, bindings = {}, {}, {}, {}
 
     def prepare(state):

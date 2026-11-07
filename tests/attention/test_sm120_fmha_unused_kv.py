@@ -237,8 +237,9 @@ def _check_tail_replays(
 @pytest.mark.parametrize("is_causal", [False, True], ids=["noncausal", "causal"])
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 @pytest.mark.parametrize("mode", ["dense", "gate", "skip"])
+@pytest.mark.parametrize("gqa_pack_size", [1, 2])
 def test_sm120_paged_unused_kv_graph(
-    head_dim, q_tile, kv_tile, page_size, is_causal, layout, mode
+    head_dim, q_tile, kv_tile, page_size, is_causal, layout, mode, gqa_pack_size
 ):
     from cutlass import Float32, Int32
 
@@ -298,6 +299,7 @@ def test_sm120_paged_unused_kv_graph(
         enable_skip_softmax=threshold is not None,
         kv_layout=layout,
         with_output_gate=gate is not None,
+        gqa_pack_size=gqa_pack_size,
     )
 
     def run():
@@ -316,7 +318,7 @@ def test_sm120_paged_unused_kv_graph(
             None,
             Int32(q_tile),
             False,
-            *((gate,) if gate is not None else ()),
+            gate,
         )
 
     graph = _capture(run)
@@ -450,6 +452,7 @@ def test_sm120_paged_causal_empty_cta_graph(head_dim, q_tile, kv_tile, page_size
             None,
             Int32(q_length),
             False,
+            None,
         )
 
     graph = _capture(run)

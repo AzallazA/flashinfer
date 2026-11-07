@@ -3052,7 +3052,13 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         gate_ptr = (
                             output_gate.iterator.raw_ptr()
                             + (q_token_base + store_q_seq_idx) * output_gate.stride[0]
-                            + q_head_idx * output_gate.stride[1]
+                            + (
+                                q_head_idx
+                                + self.q_row_head_offset(
+                                    store_row_in_cta, cutlass.Int32(1)
+                                )
+                            )
+                            * output_gate.stride[1]
                             + store_col_in_cta
                         )
                         gate_vec = gate_ptr.load(count=8, alignment=16)

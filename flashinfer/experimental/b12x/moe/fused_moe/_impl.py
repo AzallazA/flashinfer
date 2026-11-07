@@ -2877,8 +2877,6 @@ def _heuristic_moe_decode_config(
             and query.routed_rows > _DIRECT_ROUTING_MAX_ROUTED_ROWS
         ):
             backend = "dynamic"
-    if backend == "micro" and query.deterministic_output:
-        backend = "dynamic"
     dynamic_tile_m = None
     dynamic_route_mode = None
     if backend == "dynamic":
@@ -12812,6 +12810,7 @@ def _dynamic_topk_sum_op(
         element_dtype=element_dtype,
         float32_output=output.dtype == torch.float32,
         apply_topk_weights=False,
+        route_ids_dtype=route_expert_ids.dtype,
     )
     from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import (
         _w4a16_topk_sum_launch_flat,
@@ -12825,19 +12824,15 @@ def _dynamic_topk_sum_op(
         k,
         element_dtype,
         int(current_cuda_stream()),
-        _int32_route_ids(route_expert_ids),
+        route_expert_ids=route_expert_ids,
         launcher=launcher,
     )
 
 
-def _int32_route_ids(route_expert_ids: torch.Tensor) -> torch.Tensor:
-    if route_expert_ids.dtype == torch.int32:
-        return route_expert_ids
-    return route_expert_ids.to(torch.int32)
-
-
 @_dynamic_topk_sum_op.register_fake
-def _dynamic_topk_sum_fake(route_output, output, m, num_topk, k, route_expert_ids) -> None:
+def _dynamic_topk_sum_fake(
+    route_output, output, m, num_topk, k, route_expert_ids
+) -> None:
     pass
 
 

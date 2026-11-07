@@ -1192,7 +1192,7 @@ class W4A16A4PrefillLaunches:
     quant: object
     fc1: object
     fc2: object
-    topk_sum: object
+    topk_sum: dict[torch.dtype, object]
     route_pack: object
 
     def carriers(self) -> tuple[object, ...]:
@@ -1200,7 +1200,7 @@ class W4A16A4PrefillLaunches:
             self.quant,
             self.fc1,
             self.fc2,
-            self.topk_sum,
+            *self.topk_sum.values(),
             *self.route_pack.carriers(),
         )
 
@@ -1334,13 +1334,17 @@ def compile_w4a16_a4_prefill(
         swiglu_limit=swiglu_limit,
         swiglu_clamp_after_silu=swiglu_clamp_after_silu,
     )
-    topk_sum = compile_w4a16_topk_sum(
-        m=tokens,
-        topk=topk,
-        hidden_size=hidden_size,
-        element_dtype="bf16",
-        apply_topk_weights=True,
-    )
+    topk_sum = {
+        ids_dtype: compile_w4a16_topk_sum(
+            m=tokens,
+            topk=topk,
+            hidden_size=hidden_size,
+            element_dtype="bf16",
+            apply_topk_weights=True,
+            route_ids_dtype=ids_dtype,
+        )
+        for ids_dtype in (torch.int32, torch.int64)
+    }
     route_pack = compile_w4a16_route_pack_launches(
         tokens=tokens,
         topk=topk,
@@ -1543,7 +1547,9 @@ def run_w4a16_a4_prefill(
         "bf16",
         torch.cuda.current_stream().cuda_stream,
         topk_weights=topk_weights.view(-1),
-        launcher=launches.topk_sum,
+        route_expert_ids=topk_ids.view(-1),
+        num_experts=launches.num_experts,
+        launcher=launches.topk_sum[topk_ids.dtype],
     )
     return output
 

@@ -299,7 +299,11 @@ def _compile_sm120_fmha_fp8_paged_kernel(
         cutlass.Int32(1),  # runtime max_seqlen_q placeholder
         True,  # use_pdl placeholder (runtime-dynamic)
         *((fake_output_gate,) if with_output_gate else ()),
-        *((fake_kv_tile_ranges,) if not with_output_gate or with_kv_tile_ranges else ()),
+        *(
+            (fake_kv_tile_ranges,)
+            if not with_output_gate or with_kv_tile_ranges
+            else ()
+        ),
         options="--enable-tvm-ffi",
     )
 
