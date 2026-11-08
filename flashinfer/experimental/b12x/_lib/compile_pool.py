@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import importlib
 import multiprocessing
 import os
@@ -405,6 +406,7 @@ def _initialize_worker(
 def _run_job(payload: bytes, expected: tuple[ProgramKey, ...]):
     import torch
     from .compiler import compile_cache_info
+    from .program_cache import evict_unretained
 
     job = pickle.loads(payload)
     before_cute = int(compile_cache_info()["compile_misses"])
@@ -431,12 +433,16 @@ def _run_job(payload: bytes, expected: tuple[ProgramKey, ...]):
     except Exception as error:
         # Many compiler-specific exception constructors are not pickle-safe.
         raise RuntimeError(f"{job.factory}: {type(error).__name__}: {error}") from error
-    return (
+    completed = (
         os.getpid(),
         int(compile_cache_info()["compile_misses"]) - before_cute,
         _WORKER_TRITON_COMPILES - before_triton,
         expected,
     )
+    del result
+    evict_unretained(())
+    gc.collect()
+    return completed
 
 
 def _describe_jobs(payloads: tuple[bytes, ...]):
