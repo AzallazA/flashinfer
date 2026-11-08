@@ -593,6 +593,7 @@ def run_w4a16_moe(
     rotation_a_up: torch.Tensor | None = None,
     route_mode: str = "auto",
     route_pack_launches=None,
+    routes_packed: bool = False,
     stream: cuda.CUstream | None = None,
 ) -> torch.Tensor:
     activation = normalize_moe_activation(activation)
@@ -1183,21 +1184,22 @@ def run_w4a16_moe(
             raise RuntimeError(
                 "prepared W4A16 packed route execution is missing route-pack programs"
             )
-        packed_route_indices, block_expert_ids, packed_route_count = (
-            pack_topk_routes_by_expert(
-                topk_ids,
-                block_size_m,
-                route_num_experts,
-                expert_map=expert_map,
-                packed_route_indices=packed_route_indices,
-                block_expert_ids=block_expert_ids,
-                packed_route_count=packed_route_count,
-                expert_offsets=expert_offsets,
-                expert_counts=expert_counts,
-                launches=route_pack_launches,
-                stream=stream,
+        if not routes_packed:
+            packed_route_indices, block_expert_ids, packed_route_count = (
+                pack_topk_routes_by_expert(
+                    topk_ids,
+                    block_size_m,
+                    route_num_experts,
+                    expert_map=expert_map,
+                    packed_route_indices=packed_route_indices,
+                    block_expert_ids=block_expert_ids,
+                    packed_route_count=packed_route_count,
+                    expert_offsets=expert_offsets,
+                    expert_counts=expert_counts,
+                    launches=route_pack_launches,
+                    stream=stream,
+                )
             )
-        )
         route_slots_for_scratch = int(packed_route_indices.numel())
         required_m_blocks = int(block_expert_ids.numel())
 

@@ -3313,6 +3313,44 @@ def validate_live_moe_graph(
     return metrics
 
 
+def selected_csf_expansion(binding) -> dict | None:
+    """Describe the scale decoder bound to the measured MoE invocation."""
+    decoder = binding.experts.nvfp4_csf
+    if decoder is None:
+        return None
+    routes_packed = bool(getattr(binding, "csf_route_pack", False))
+    packed_geometry = (
+        dict(
+            zip(
+                (
+                    "route_capacity",
+                    "block_size",
+                    "max_packed_routes",
+                    "max_route_blocks",
+                ),
+                decoder.packed_route_geometry,
+                strict=True,
+            )
+        )
+        if routes_packed
+        else None
+    )
+    return {
+        "routes_packed": routes_packed,
+        "packed_route_geometry": packed_geometry,
+        "planes": {
+            name: {
+                "geometry": list(plane.geometry),
+                "groups_per_task": getattr(plane, "groups_per_task", None),
+                "shared_exceptions": getattr(plane, "shared_exceptions", None),
+            }
+            for name, plane in (("fc1", decoder.first), ("fc2", decoder.second))
+        },
+        "direct_routes": decoder.direct_routes,
+        "bitmap_routes": decoder.bitmap_routes,
+    }
+
+
 def prepare_moe_execution(
     *,
     session: PreparationSession,
@@ -4965,6 +5003,7 @@ def bench_e2e() -> None:
                 "query": exact.selection.query.to_dict(),
                 "invocation": exact.invocation.to_dict(),
             },
+            "csf_expansion": selected_csf_expansion(backend_binding),
             "oracle_quant_scale_math": oracle_scale_mode,
             "oracle": asdict(backend_metrics) if backend_metrics is not None else None,
             "graph_samples_ms": {},
@@ -5128,8 +5167,9 @@ def bench_e2e() -> None:
                         ) as profiler:
                             graph.replay()
                             torch.cuda.synchronize()
-                        trace_path = (
-                            args.torch_trace_dir / f"m{batch_size}-{name}.trace.json"
+                        trace_path = args.torch_trace_dir / (
+                            f"m{batch_size}-{record['routing_workload']}-"
+                            f"seed{record['input_seed']}-{name}.trace.json"
                         )
                         profiler.export_chrome_trace(str(trace_path))
                     if args.profile_graphs:

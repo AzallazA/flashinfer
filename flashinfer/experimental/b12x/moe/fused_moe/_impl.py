@@ -1297,6 +1297,7 @@ class TPMoEFP4Binding:
     a4_prefill_launches: object | None = None
     # The caller expanded every expert's NVFP4-CSF scales with expand_scales().
     scales_expanded: bool = False
+    csf_route_pack: bool = False
     mixed_trellis_binding: object | None = None
     mixed_trellis_buffers: object | None = None
     compiler_scratch: torch.Tensor | None = None
@@ -13526,6 +13527,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         and topk_ids.numel() > 0
     )
     inline_scales = None
+    routes_packed = False
     if experts.nvfp4_csf is not None and plan.decode_config.csf_inline_scales:
         inline_scales = (
             experts.nvfp4_csf.first.scales,
@@ -13549,7 +13551,16 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             w1_blockscale,
             w2_blockscale,
             barriers=barriers,
+            packed_routes=(
+                _require_binding_field(binding, "packed_route_indices"),
+                _require_binding_field(binding, "block_expert_ids"),
+                _require_binding_field(binding, "packed_route_count"),
+            )
+            if binding.csf_route_pack
+            else None,
+            expert_map=binding.route_expert_map,
         )
+        routes_packed = binding.csf_route_pack
     workspace = None
     apply_router_weight_on_input = binding.apply_router_weight_on_input
     output = binding.output
@@ -13850,6 +13861,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
             route_pack_launches=binding.route_pack_launches,
+            routes_packed=routes_packed,
             route_block_size_m=binding.route_block_size_m,
             intermediate_rotation_scales=(
                 prepared.intermediate_rotations if full_rotation else None
