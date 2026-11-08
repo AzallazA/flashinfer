@@ -595,6 +595,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
                 weight_layout=weight_layout,
             )
         ):
+            split = caps.decode_config.w4a16_direct_schedule == "split"
             launches = tuple(
                 _compile_w4a16_small_m_direct(
                     **native_args,
@@ -602,13 +603,32 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
                     fast_math=caps.w4a16_fast_math,
                     topk_ids_dtype=ids_dtype,
                     device=core.device,
+                    compile_time_phase=1 if split else 0,
                 )
                 for m in range(1, native_tokens + 1)
                 for ids_dtype in (torch.int32, torch.int64)
             )
+            fc2_launches = (
+                tuple(
+                    _compile_w4a16_small_m_direct(
+                        **native_args,
+                        m=m,
+                        fast_math=caps.w4a16_fast_math,
+                        topk_ids_dtype=ids_dtype,
+                        device=core.device,
+                        compile_time_phase=3,
+                    )
+                    for m in range(1, native_tokens + 1)
+                    for ids_dtype in (torch.int32, torch.int64)
+                )
+                if split
+                else ()
+            )
             native_direct = attach_programs(
-                W4A16SmallMDirectCompileResult(int(route_block), launches),
-                *(launch.compiled for launch in launches),
+                W4A16SmallMDirectCompileResult(
+                    int(route_block), launches, fc2_launches
+                ),
+                *(launch.compiled for launch in (*launches, *fc2_launches)),
             )
             # Native micro kernels support K16 tails outside the generic tile grid.
             if scale_format == "e4m3_k16" and core.n % 64:
@@ -650,6 +670,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             force_tile_config=caps.decode_config.w4a16_tile_config,
             csf_inline_scales=caps.decode_config.csf_inline_scales,
             pipeline_stages=caps.decode_config.w4a16_pipeline_stages,
+            fc1_pipeline_stages=caps.decode_config.w4a16_fc1_pipeline_stages,
             skip_empty_m_blocks=caps.w4a16_skip_empty_m_blocks,
             small_m_occupancy=caps.w4a16_small_m_occupancy,
         )

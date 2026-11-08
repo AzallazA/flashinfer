@@ -1003,6 +1003,16 @@ def run_w4a16_moe(
             torch.ops.b12x.w4a16_small_m_direct_launch(*launch_args)
         else:
             _w4a16_small_m_direct_launch_flat(*launch_args, launcher=direct_launch)
+            if (
+                isinstance(fused_launch, W4A16SmallMDirectCompileResult)
+                and fused_launch.fc2_launches
+            ):
+                fc2_launch = next(
+                    launch
+                    for launch in fused_launch.fc2_launches
+                    if launch.topk_ids_dtype == topk_ids.dtype and launch.m == m
+                )
+                _w4a16_small_m_direct_launch_flat(*launch_args, launcher=fc2_launch)
         return output
 
     if isinstance(fused_launch, W4A16SmallMDirectCompileResult):
