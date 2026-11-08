@@ -2815,8 +2815,33 @@ class PreparationJob:
     def _install_obligation(self, obligation, selections):
         request, plan = obligation.request, obligation.request.plan
         selection = obligation.selection
-        if self.session._scratch_limit is not None:
-            self.session._candidate_memory(obligation.requests, selection.config)
+        validated_scratch = set()
+        default_selection = None
+
+        def validate_scratch(selected):
+            if self.session._scratch_limit is not None:
+                payload = plan.contract.config_payload(selected.config)
+                if payload not in validated_scratch:
+                    self.session._candidate_memory(obligation.requests, selected.config)
+                    validated_scratch.add(payload)
+
+        def warmup_selection(prepared):
+            nonlocal default_selection
+            if prepared is not None:
+                return prepared.selection
+            if default_selection is None:
+                configuration = obligation.configuration
+                source = "override" if configuration.pinned is not None else "default"
+                default_selection = self._selection(
+                    obligation, configuration.default, source
+                )
+                if self.session._scratch_limit is not None:
+                    validated_scratch.add(
+                        plan.contract.config_payload(default_selection.config)
+                    )
+            return default_selection
+
+        validate_scratch(selection)
         self._active_request = request
         if self._warmup_only:
             obligation.finalists = ()
@@ -2832,9 +2857,7 @@ class PreparationJob:
                 )
                 yield from self._wait_programs(programs, obligation)
             if self._warmup_only:
-                configuration = obligation.configuration
-                source = "override" if configuration.pinned is not None else "default"
-                selection = self._selection(obligation, configuration.default, source)
+                selection = warmup_selection(None)
                 obligation.selection = selection
                 obligation.cache_pending = False
                 obligation.coverage = {}
@@ -2866,15 +2889,8 @@ class PreparationJob:
                 for program in self._dependency_programs[name]
             )
             if self._warmup_only:
-                configuration = obligation.configuration
-                source = "override" if configuration.pinned is not None else "default"
-                selection = (
-                    prepared.selection
-                    if prepared is not None
-                    else self._selection(obligation, configuration.default, source)
-                )
-            if self.session._scratch_limit is not None:
-                self.session._candidate_memory(obligation.requests, selection.config)
+                selection = warmup_selection(prepared)
+            validate_scratch(selection)
             if (
                 prepared is None
                 or prepared.selection != selection
@@ -2886,19 +2902,8 @@ class PreparationJob:
                     if item.collective is not None:
                         yield item.collective
                     if self._warmup_only:
-                        configuration = obligation.configuration
-                        source = (
-                            "override"
-                            if configuration.pinned is not None
-                            else "default"
-                        )
-                        selection = (
-                            prepared.selection
-                            if prepared is not None
-                            else self._selection(
-                                obligation, configuration.default, source
-                            )
-                        )
+                        selection = warmup_selection(prepared)
+                        validate_scratch(selection)
                     if prepared is None or prepared.selection != selection:
                         self._phase = (
                             ("warming heuristics" if self._warmup_only else "priming")

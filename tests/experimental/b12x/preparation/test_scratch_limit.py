@@ -292,3 +292,161 @@ def test_scratch_admission_preserves_sharded_counts_and_finalist_indices(
     finally:
         for engine in engines:
             engine.close()
+
+
+def _install_payload(item, configuration, config, device):
+    from b12x.preparation.types import Selection, _Prepared
+
+    selection = Selection(
+        item.plan.component_id, configuration.encoded_query, config, "tuned"
+    )
+    item.plan._install(
+        _Prepared(
+            SimpleNamespace(value=getattr(config, "width", 1) * 3),
+            selection,
+            frozenset(),
+            None,
+            (),
+            (),
+            device,
+            users=[item.plan],
+        )
+    )
+    return selection
+
+
+def test_installation_checks_real_glm_bindings_once(tmp_path):
+    from b12x.attention.dsa_indexer import glm_pool
+    from b12x.preparation.session import PreparationJob, _Obligation
+
+    calls, requests = [], []
+    with session(tmp_path) as engine:
+        engine.configure_scratch_limit(0)
+        for index in range(64):
+            plan = glm_pool._plan(
+                glm_pool.PoolQuery(mode="quantize", rows=64), torch.device("cpu")
+            )
+            original = plan._memory_requirements
+
+            def memory(config, device, original=original):
+                calls.append(config)
+                return original(config, device)
+
+            plan = replace(plan, _memory_requirements=memory)
+            item = plan.request(
+                name=f"quantize{index}", prepare_call=lambda state: None
+            )
+            configuration = plan.contract.configure(plan.query, device=None)
+            _install_payload(item, configuration, configuration.default, engine.device)
+            requests.append(item)
+        obligation = _Obligation(
+            requests[0],
+            configuration,
+            requests=tuple(requests),
+            selection=requests[0].plan.selection,
+            ready=True,
+        )
+        job = PreparationJob(engine, tuple(requests), autotune=True)
+        calls.clear()
+        selections = {}
+        assert list(job._install_obligation(obligation, selections)) == []
+        assert len(selections) == len(requests)
+        assert len(calls) == len(requests)
+
+
+def test_warmup_checks_each_retained_configuration_across_all_bindings(tmp_path):
+    from b12x.preparation.session import PreparationJob, _Obligation
+
+    tuning = contract(default=1)
+    first = _request("first", tuning=tuning, scale=256)
+    second = _request("second", tuning=tuning, scale=128)
+    with session(tmp_path) as engine:
+        engine.configure_scratch_limit(256)
+        configuration = tuning.configure(first.plan.query, device=None)
+        selected = _install_payload(first, configuration, Config(1), engine.device)
+        _install_payload(second, configuration, Config(2), engine.device)
+        obligation = _Obligation(
+            first,
+            configuration,
+            requests=(first, second),
+            selection=selected,
+            ready=True,
+        )
+        job = PreparationJob(engine, (first, second), autotune=False)
+        with pytest.raises(CandidateResourceIneligibleError, match="scratch limit"):
+            list(job._install_obligation(obligation, {}))
+        assert first.plan.selection.config == Config(1)
+        assert second.plan.selection.config == Config(2)
+
+
+def test_shared_alias_configuration_rechecks_the_entire_installation_group(tmp_path):
+    from b12x.preparation.session import PreparationJob, _Obligation, _declaration_key
+
+    tuning = contract(default=1)
+    first = _request("first", tuning=tuning, scale=256)
+    alias = _request("alias", tuning=tuning, scale=128, shared=True)
+    last = _request("last", tuning=tuning, scale=128)
+    owner = _request("owner", tuning=tuning, scale=128, shared=True)
+    with session(tmp_path) as engine:
+        engine.configure_scratch_limit(256)
+        configuration = tuning.configure(first.plan.query, device=None)
+        selected = _install_payload(first, configuration, Config(1), engine.device)
+        _install_payload(last, configuration, Config(1), engine.device)
+        _install_payload(owner, configuration, Config(2), engine.device)
+        engine._shared[_declaration_key(owner.plan)] = owner.plan
+        requests = (first, alias, last)
+        obligation = _Obligation(
+            first,
+            configuration,
+            requests=requests,
+            selection=selected,
+            ready=True,
+        )
+        job = PreparationJob(engine, requests, autotune=True)
+        with pytest.raises(CandidateResourceIneligibleError, match="scratch limit"):
+            list(job._install_obligation(obligation, {}))
+        assert alias.plan.prepared is owner.plan.prepared
+        assert last.plan.selection.config == Config(1)
+
+
+def test_warmup_default_binding_checks_scale_linearly(tmp_path):
+    from b12x.preparation.session import PreparationJob, _Obligation
+    from b12x.preparation.types import Selection
+
+    observed = []
+    for count in (4, 16):
+        calls, requests = [], []
+        tuning = contract(default=1)
+        for index in range(count):
+            item = _request(f"binding{index}", tuning=tuning)
+            original = item.plan._memory_requirements
+
+            def memory(config, device, original=original):
+                calls.append(config)
+                return original(config, device)
+
+            requests.append(
+                replace(item, plan=replace(item.plan, _memory_requirements=memory))
+            )
+        with session(tmp_path / str(count), prime=False) as engine:
+            engine.configure_scratch_limit(256)
+            configuration = tuning.configure(requests[0].plan.query, device=None)
+            selected = Selection(
+                requests[0].plan.component_id,
+                configuration.encoded_query,
+                configuration.default,
+                "default",
+            )
+            obligation = _Obligation(
+                requests[0],
+                configuration,
+                requests=tuple(requests),
+                selection=selected,
+            )
+            job = PreparationJob(engine, tuple(requests), autotune=False)
+            assert all(
+                step == "gpu" for step in job._install_obligation(obligation, {})
+            )
+            assert all(item.plan.selection.config == Config(1) for item in requests)
+            observed.append(len(calls))
+    assert observed[1] <= 4 * observed[0]
