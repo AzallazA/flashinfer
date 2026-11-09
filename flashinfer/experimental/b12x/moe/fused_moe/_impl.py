@@ -2613,6 +2613,9 @@ def _w4a8_mx_micro_supported(
     activation: str,
     source_format: str,
     deterministic_output: bool = False,
+    swiglu_clamp_after_silu: bool = False,
+    swiglu_alpha: object = None,
+    swiglu_beta: object = None,
 ) -> bool:
     source_format = _canonical_moe_policy_source_format(source_format)
     if source_format == "b12x_trellis":
@@ -2639,6 +2642,11 @@ def _w4a8_mx_micro_supported(
         )
     return (
         not deterministic_output
+        and _tiny_decode_swiglu_supported(
+            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
         and _tiny_decode_enabled()
         and _tiny_decode_supports(
             num_tokens=num_tokens,
@@ -2662,6 +2670,9 @@ def _w4a8_mx_micro_preferred(
         activation=query.activation,
         source_format=query.source_format,
         deterministic_output=query.deterministic_output,
+        swiglu_clamp_after_silu=query.swiglu_clamp_after_silu,
+        swiglu_alpha=query.swiglu_alpha,
+        swiglu_beta=query.swiglu_beta,
     ):
         return False
     if (
@@ -2703,6 +2714,9 @@ def _policy_micro_supported(query: MoeDecodeQuery) -> bool:
             activation=query.activation,
             source_format=query.source_format,
             deterministic_output=query.deterministic_output,
+            swiglu_clamp_after_silu=query.swiglu_clamp_after_silu,
+            swiglu_alpha=query.swiglu_alpha,
+            swiglu_beta=query.swiglu_beta,
         )
     return _band_runs_direct_micro(
         num_tokens=query.num_tokens,
@@ -13043,6 +13057,22 @@ def _tiny_decode_supports(*, num_tokens: int, k: int, n: int, activation: str) -
     )
 
 
+def _tiny_decode_swiglu_supported(
+    *,
+    swiglu_clamp_after_silu: bool = False,
+    swiglu_alpha: object = None,
+    swiglu_beta: object = None,
+) -> bool:
+    # tiny_decode specializes swiglu_limit (pre-SiLU gate/up clamp) at compile
+    # time, but implements neither post-SiLU clamping nor SwiGLU alpha/beta.
+    # Unset and identity values (alpha 1, beta 0) are plain SiLU-GLU.
+    return (
+        not swiglu_clamp_after_silu
+        and (swiglu_alpha is None or swiglu_alpha == 1.0)
+        and (swiglu_beta is None or swiglu_beta == 0.0)
+    )
+
+
 _TINY_DECODE_KERNEL_CACHE: dict = {}
 register_program_cache(_TINY_DECODE_KERNEL_CACHE)
 
@@ -13056,6 +13086,7 @@ def _get_tiny_decode_kernel(
     *,
     device: torch.device | None = None,
     topk_ids_dtype: torch.dtype = torch.int32,
+    swiglu_limit: float | None = None,
 ):
     from b12x.moe._shared.kernels.tiny_decode import (
         MoETinyDecodeKernelBackendPhase1,
@@ -13066,11 +13097,11 @@ def _get_tiny_decode_kernel(
         raise TypeError("tiny decode expert IDs must be int32 or int64")
     ids_type = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
     compiled_phases = []
-    for kernel_cls in (
-        MoETinyDecodeKernelBackendPhase1,
-        MoETinyDecodeKernelBackendPhase2,
+    # Only FC2 applies the activation, so only phase 2 specializes the clamp.
+    for kernel in (
+        MoETinyDecodeKernelBackendPhase1(),
+        MoETinyDecodeKernelBackendPhase2(swiglu_limit=swiglu_limit),
     ):
-        kernel = kernel_cls()
         kernel.configure(m, k, n, num_topk, weight_E, device=device)
         cache_key = ("tiny_decode", str(topk_ids_dtype)) + kernel.__cache_key__
         cached = None if planning() else _TINY_DECODE_KERNEL_CACHE.get(cache_key)
@@ -13126,6 +13157,7 @@ def _launch_tiny_decode_flat(
     k: int,
     n: int,
     num_topk: int,
+    swiglu_limit: float | None = None,
 ) -> None:
     from b12x.moe._shared.kernels.tiny_decode import (
         MoETinyDecodeKernelBackend,
@@ -13133,7 +13165,14 @@ def _launch_tiny_decode_flat(
 
     del barrier_count, barrier_epoch
     compiled_fc1, compiled_fc2 = _get_tiny_decode_kernel(
-        weight_E, m, k, n, num_topk, device=a.device, topk_ids_dtype=launch_ids.dtype
+        weight_E,
+        m,
+        k,
+        n,
+        num_topk,
+        device=a.device,
+        topk_ids_dtype=launch_ids.dtype,
+        swiglu_limit=swiglu_limit,
     )
     rt = m * num_topk
     inter = micro_intermediate.view(torch.float32).reshape(-1)[: rt * 2 * n]
@@ -13173,6 +13212,7 @@ def _tp_moe_tiny_decode_launch_op(
     k: int,
     n: int,
     num_topk: int,
+    swiglu_limit: float | None,
     volatile_launch_state: bool,
 ) -> None:
     del volatile_launch_state
@@ -13193,6 +13233,7 @@ def _tp_moe_tiny_decode_launch_op(
         k=k,
         n=n,
         num_topk=num_topk,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -13214,6 +13255,7 @@ def _tp_moe_tiny_decode_launch_fake(
     k: int,
     n: int,
     num_topk: int,
+    swiglu_limit: float | None,
     volatile_launch_state: bool,
 ) -> None:
     return None
@@ -13385,6 +13427,7 @@ def _launch_micro(
             k,
             n,
             num_topk,
+            swiglu_limit,
             workspace.volatile_launch_state,
         )
         return

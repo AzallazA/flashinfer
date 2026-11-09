@@ -1030,6 +1030,7 @@ def _program_carriers(
                         plan.num_topk,
                         device=plan.device,
                         topk_ids_dtype=dtype,
+                        swiglu_limit=plan.swiglu_limit,
                     )
                 )
         else:
